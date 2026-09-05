@@ -1,0 +1,248 @@
+--- a/voice_mode/simple_failover.py
++++ b/voice_mode/simple_failover.py
+@@ -7,6 +7,9 @@
+ 
+ import asyncio
+ import logging
++import os
++import re
++import httpx
+ from typing import Optional, Tuple, Dict, Any
+ from openai import AsyncOpenAI, APIConnectionError, APIStatusError
+ from .openai_error_parser import OpenAIErrorParser
+@@ -349,8 +352,194 @@
+     if isinstance(e, APIStatusError):
+         return e.status_code >= 500
+     return False
++
++
++# Whisper emits these verbatim when handed near-silence. They come from its
++# training data (YouTube captions), not from the microphone. After a barge-in
++# cut the recording often opens on silence, so these surface as if the user had
++# spoken them - the same silent-wrong-input problem as prompt echo, and just as
++# damaging: the agent then acts on words that were never said.
++_HALLUCINATIONS = {
++    "thank you for watching", "thanks for watching", "thank you",
++    "thanks for listening", "please subscribe", "you", "bye", "so",
++    "subtitles by the amara.org community", "amara.org", "[blank_audio]",
++    "[silence]", "transcription by castingwords", ".", "...",
++}
++_HALLUCINATION_MAX_CHARS = 40
++
++
++# Whisper turns a vocabulary term into a bare domain on near-silent audio
++# ("www.adblue.com", 2026-09-06). A whole transcript that is just a URL/domain
++# is never user speech in this setup.
++_VM_URL_HALLUCINATION = re.compile(r"(https?://)?(www\.)?[\w-]+(\.[\w-]+)+/?[.!?]?")
++# the user speaks English, Urdu and Punjabi, never Hindi. Whisper auto-detect
++# renders his Urdu as Hindi (Devanagari) or Punjabi (Gurmukhi); re-run once
++# forced to Urdu so the transcript is in Urdu script.
++_VM_URDU_NOT_HINDI = os.environ.get("VOICEMODE_URDU_NOT_HINDI", "1") not in ("0", "false", "False")
++
++
++def _is_probable_hallucination(text: str) -> bool:
++    """True if the WHOLE transcript is a known silence artifact.
++
++    Deliberately conservative: exact match only, and only on a short
++    transcript. If the user genuinely says "thank you" as their entire turn it
++    is dropped - an acceptable trade against acting on invented input.
++    """
++    if not text:
++        return False
++    t = re.sub(r"\s+", " ", text.strip().strip('"\u201c\u201d').lower())
++    if len(t) > _HALLUCINATION_MAX_CHARS:
++        return False
++    if _VM_URL_HALLUCINATION.fullmatch(t.strip()):
++        return True
++    return t in _HALLUCINATIONS or t.rstrip("!.?, ") in _HALLUCINATIONS
++
++
++
++def _collapse_repeats(text: str, prompt: str) -> str:
++    """Strip a REPEATING prompt echo from anywhere in the transcript.
++
++    _strip_prompt_echo only removes vocabulary terms from the START. Whisper's
++    other failure mode is a loop: it emitted "De-rack, re-rack, flight case"
++    thirty-five times, none of it spoken. A leading-only guard misses that
++    entirely and the loop reaches the agent as the user's words.
++
++    Terms can be MULTI-WORD ("flight case", "Iveco Daily"), so matching has to
++    be done over token sequences - splitting on whitespace and comparing single
++    words silently never matches those, which is how the first version of this
++    failed to remove anything at all.
++
++    Only runs longer than MAX_RUN are dropped: real speech can legitimately
++    contain two or three vocabulary terms ("a de-rack at Equinix then a
++    re-rack"), but not a dozen back to back.
++    """
++    if not text or not prompt:
++        return text
++
++    def norm(tok: str) -> str:
++        return re.sub(r"[^a-z0-9]+", "", tok.lower())
++
++    terms = set()
++    for raw in prompt.split(","):
++        toks = tuple(norm(t) for t in raw.split() if norm(t))
++        if toks:
++            terms.add(toks)
++    if not terms:
++        return text
++    max_len = max(len(t) for t in terms)
++
++    words = text.split()
++    nwords = [norm(w) for w in words]
++
++    MAX_RUN = 3
++    out, i, removed = [], 0, 0
++    while i < len(words):
++        # Greedily consume the longest chain of consecutive vocabulary terms.
++        j, run, chain = i, 0, []
++        while j < len(words):
++            hit = None
++            for L in range(min(max_len, len(words) - j), 0, -1):
++                if tuple(nwords[j:j + L]) in terms:
++                    hit = L
++                    break
++            if hit is None:
++                break
++            chain.extend(words[j:j + hit])
++            j += hit
++            run += 1
++        if run > MAX_RUN:
++            removed += run
++            i = j                      # drop the whole chain
++        elif run:
++            out.extend(chain)
++            i = j
++        else:
++            out.append(words[i])
++            i += 1
++
++    result = " ".join(out).strip(" ,")
++    result = re.sub(r"(,\s*){2,}", ", ", result).strip(" ,")
++    if removed:
++        logger.warning(
++            "STT: collapsed %d repeated prompt terms - Whisper looping on "
++            "VOICEMODE_STT_PROMPT, NOT user speech (%d -> %d chars)",
++            removed, len(text), len(result))
++    return result
+ 
+ 
++def _strip_prompt_echo(text: str, prompt: str) -> str:
++    """Remove a regurgitated STT prompt from a transcription.
++
++    Whisper echoes its `prompt` back verbatim when the audio contains little
++    or no speech. That is common right after a barge-in cut, where the
++    recording opens on near-silence. The result is that the vocabulary list
++    is returned AS IF THE USER SPOKE IT, which puts words in their mouth and
++    is far worse than returning nothing.
++
++    Strategy: find the longest leading run of prompt terms in the transcript
++    and drop it, keeping any genuine speech that followed. If what remains is
++    empty, the caller sees an empty transcription and treats it as no speech.
++    """
++    if not text or not prompt:
++        return text
++    terms = [t.strip().lower() for t in prompt.split(",") if t.strip()]
++    if not terms:
++        return text
++
++    # Compare on a normalised form so punctuation/case differences do not hide
++    # the echo (Whisper re-cases and re-punctuates freely).
++    def norm(x):
++        return re.sub(r"[^a-z0-9 ]+", " ", x.lower()).strip()
++
++    remaining = text
++    stripped_any = False
++    matched = 0
++    guard = 0
++    while guard < 64:
++        guard += 1
++        n = norm(remaining)
++        hit = None
++        for t in terms:
++            nt = norm(t)
++            # Require a WORD BOUNDARY after the match. Without this, the prompt
++            # term "re-rack" strips the front of a genuinely spoken
++            # "re-racking", mangling real speech into "ing 21 assets...".
++            if nt and n.startswith(nt) and (len(n) == len(nt) or n[len(nt)] == " "):
++                if hit is None or len(nt) > len(norm(hit)):
++                    hit = t
++        if hit is None:
++            break
++        # Consume the matched span plus any trailing separator.
++        idx = 0
++        want = norm(hit)
++        seen = ""
++        for i, ch in enumerate(remaining):
++            seen = norm(remaining[: i + 1])
++            if seen == want:
++                idx = i + 1
++                break
++        if idx == 0:
++            break
++        remaining = remaining[idx:].lstrip(" ,.;:-\u2014").lstrip()
++        stripped_any = True
++        matched += 1
++
++    # A prompt echo is a RUN of vocabulary terms. A single leading term is far
++    # more likely to be genuine speech ("Equinix is the destination"), so only
++    # treat it as an echo when at least two terms matched back to back.
++    if matched < 2:
++        return text
++
++    if stripped_any:
++        logger.warning(
++            "STT: stripped regurgitated prompt echo (%d -> %d chars). This is "
++            "Whisper repeating VOICEMODE_STT_PROMPT on low-speech audio; the "
++            "removed text was NOT spoken by the user.",
++            len(text), len(remaining),
++        )
++    return remaining
++
++
+ async def simple_stt_failover(
+     audio_file,
+     model: Optional[str] = None,
+@@ -420,7 +609,13 @@
+             client = AsyncOpenAI(
+                 api_key=api_key,
+                 base_url=base_url,
+-                timeout=60.0,  # Allow time for slower transcriptions
++                # LOCAL PATCH: a bare `timeout=60.0` applied 60s to *connect* as
++                # well as read. A blackholed SYN to a LAN STT host therefore
++                # stalled the whole turn for 60s before the SDK retried (which
++                # then succeeded in ~1s). Keep the generous read budget for slow
++                # transcriptions, but fail a dead connect fast so the retry can
++                # do its job. See simple_failover.py.bak for the original.
++                timeout=httpx.Timeout(60.0, connect=5.0),
+                 max_retries=max_retries
+             )
+ 
+@@ -469,6 +664,25 @@
+             while True:
+                 try:
+                     transcription = await client.audio.transcriptions.create(**transcription_kwargs)
++                    if _VM_URDU_NOT_HINDI and isinstance(transcription, str) and any(
++                            "\u0900" <= ch <= "\u097f" or "\u0a00" <= ch <= "\u0a7f" for ch in transcription):
++                        logger.info("STT: Devanagari/Gurmukhi in transcript - re-transcribing forced to Urdu")
++                        _kw = dict(transcription_kwargs); _kw["language"] = "ur"
++                        transcription = await client.audio.transcriptions.create(**_kw)
++                    # GUARD: Whisper echoes its prompt back verbatim when handed audio
++                    # with little speech - common right after a barge-in cut, where the
++                    # recording opens on near-silence. Without this, VOICEMODE_STT_PROMPT
++                    # is returned as if the user had spoken it.
++                    if STT_PROMPT and isinstance(transcription, str):
++                        transcription = _strip_prompt_echo(transcription, STT_PROMPT)
++                        transcription = _collapse_repeats(transcription, STT_PROMPT)
++                        if isinstance(transcription, str) and _is_probable_hallucination(transcription):
++                            logger.warning(
++                                "STT: discarded probable silence hallucination %r - Whisper "
++                                "inventing text from near-silent audio, NOT user speech.",
++                                transcription[:60],
++                            )
++                            transcription = ""
+                     break
+                 except Exception as e:
+                     if attempt < retries and _is_transient_stt_error(e):

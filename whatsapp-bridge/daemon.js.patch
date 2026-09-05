@@ -1,0 +1,45 @@
+--- a/daemon.js
++++ b/daemon.js
+@@ -23,6 +23,7 @@
+   DisconnectReason,
+   useMultiFileAuthState,
+   fetchLatestBaileysVersion,
++  downloadMediaMessage,
+ } = require('@whiskeysockets/baileys');
+ const { Boom } = require('@hapi/boom');
+ const QRCode = require('qrcode');
+@@ -421,12 +422,34 @@
+       return send(res, 200, slice.map(({ _sort, ...rest }) => rest));
+     }
+ 
++    // Media download for images / voice notes / documents: the raw message is
++    // kept in messageStore, so the receiver (inbox_hooks) can fetch bytes by
++    // chat + message id and transcribe or view them.
++    if (route === 'GET /media') {
++      const phone = url.searchParams.get('phone');
++      const id = url.searchParams.get('id');
++      if (!phone || !id) return send(res, 400, { error: 'phone and id required' });
++      const jid = phone.includes('@') ? phone : toJid(phone);
++      const msg = (messageStore.get(jid) || []).find(m => m.key && m.key.id === id);
++      if (!msg) return send(res, 404, { error: 'message not found' });
++      try {
++        const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
++        const m = msg.message || {};
++        const inner = m.imageMessage || m.audioMessage || m.videoMessage || m.documentMessage || m.stickerMessage || {};
++        res.writeHead(200, { 'Content-Type': inner.mimetype || 'application/octet-stream', 'Content-Length': buf.length });
++        return res.end(buf);
++      } catch (err) {
++        return send(res, 500, { error: err.message });
++      }
++    }
+     if (route === 'GET /messages') {
+       const phone = url.searchParams.get('phone');
+       if (!phone) return send(res, 400, { error: 'phone required' });
+       const limit = Number(url.searchParams.get('limit')) || 20;
+       const jid = toJid(phone);
+       const msgs = (messageStore.get(jid) || []).slice(-limit).map(m => ({
++        id: m.key.id,
++        type: Object.keys(m.message || { unknown: 1 })[0],
+         from: m.key.fromMe ? 'me' : (m.pushName || resolveName(m.key.participant || m.key.remoteJid, null)),
+         text: extractText(m),
+         timestamp: formatTs(m.messageTimestamp),

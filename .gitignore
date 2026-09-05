@@ -1,0 +1,10 @@
+voiceprint.npy
+msal_cache.json
+secret
+*.jsonl
+context/
+history/
+media/
+*.bak
+__pycache__/
+.venv/

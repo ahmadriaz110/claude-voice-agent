@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.voicemode.bargein</string>
+
+    <!-- Runs inside the indicator's venv, which already has sounddevice,
+         webrtcvad, numpy and scipy. Launched via the signed app bundle's
+         interpreter would be nicer for TCC, but microphone access here is
+         granted to the venv python; see notes in the daemon docstring. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.voicemode/indicator/.venv/bin/python</string>
+        <string>__HOME__/.voicemode/indicator/bargein_daemon.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it dies: a dead barge-in daemon is invisible, you simply
+         find that interrupting stopped working. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.voicemode/indicator/bargein.out</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.voicemode/indicator/bargein.err</string>
+</dict>
+</plist>

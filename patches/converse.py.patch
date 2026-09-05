@@ -1,0 +1,274 @@
+--- a/voice_mode/tools/converse.py
++++ b/voice_mode/tools/converse.py
+@@ -6,6 +6,7 @@
+ import os
+ import threading
+ import time
++import wave
+ import traceback
+ from contextlib import asynccontextmanager
+ from dataclasses import dataclass, field
+@@ -105,6 +106,10 @@
+ from voice_mode.history_buffer import get_history_buffer
+ 
+ logger = logging.getLogger("voicemode")
++
++# Seconds to wait for ANY speech before giving up on a recording. Upstream
++# has no such bound: it waits out max_duration, which is 180s here.
++NO_SPEECH_TIMEOUT = float(os.environ.get("VOICEMODE_NO_SPEECH_TIMEOUT", 8.0))
+ 
+ # Log silence detection config at module load time
+ logger.info(f"Module loaded with DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}")
+@@ -1330,8 +1335,90 @@
+             sys.stdout = original_stdout
+         if sys.stderr != original_stderr:
+             sys.stderr = original_stderr
++
++
++
++_BARGEIN_PREROLL = Path.home() / ".voicemode" / "bargein_preroll.wav"
++_BARGEIN_PREROLL_MAX_AGE = 6.0
++
++
++def _consume_bargein_preroll(rate: int):
++    """Return audio captured by the barge-in daemon just before it interrupted.
++
++    When voice barge-in fires, the daemon has already been holding the mic and
++    has heard the opening of the sentence that triggered it. It then closes the
++    mic so VoiceMode can record, and VoiceMode starts from scratch - losing
++    everything spoken during the handover. (Observed: an interruption arriving
++    as only "and many more".)
++
++    The daemon writes what it heard to a wav; we prepend it here and delete it,
++    so it is consumed exactly once. Stale files are ignored rather than
++    prepended to an unrelated turn.
++    """
++    try:
++        if not _BARGEIN_PREROLL.exists():
++            return None
++        age = time.time() - _BARGEIN_PREROLL.stat().st_mtime
++        if age > _BARGEIN_PREROLL_MAX_AGE:
++            _BARGEIN_PREROLL.unlink(missing_ok=True)
++            logger.debug("barge-in preroll ignored (stale: %.1fs)", age)
++            return None
++        with wave.open(str(_BARGEIN_PREROLL), "rb") as w:
++            if w.getframerate() != rate or w.getnchannels() != 1 or w.getsampwidth() != 2:
++                logger.warning("barge-in preroll format mismatch; ignoring")
++                _BARGEIN_PREROLL.unlink(missing_ok=True)
++                return None
++            data = w.readframes(w.getnframes())
++        _BARGEIN_PREROLL.unlink(missing_ok=True)
++        arr = np.frombuffer(data, dtype=np.int16).reshape(-1, 1)
++        logger.info("barge-in preroll prepended: %.2fs", len(arr) / rate)
++        return arr
++    except Exception as e:
++        logger.warning("barge-in preroll failed: %s", e)
++        try:
++            _BARGEIN_PREROLL.unlink(missing_ok=True)
++        except Exception:
++            pass
++        return None
+ 
+ 
++
++# --- speaker-gated end-of-turn -------------------------------------------
++# Plain VAD keeps a recording open for ANY sound, so a noisy room never yields
++# the quiet needed to end a turn. These ask the barge-in daemon (which holds a
++# warm voiceprint model) whether recent audio is actually the enrolled speaker.
++_VM_SPEAKER_GATE = True
++_VM_VERIFY_URL = "http://127.0.0.1:8899/"
++_VM_RECORDING_FLAG = Path.home() / ".voicemode" / "indicator" / "vm_recording.flag"
++_VM_SPEAKER_MIN = 0.50
++# Speaker FILTER on the listen window. Wake and barge-in are already locked to
++# the enrolled voice, but the reply window recorded whoever spoke: a bystander
++# or a TV could land as the user's answer. Score the whole take; below this
++# similarity it is dropped and we listen again (at most _MAX times per turn).
++# Measured 2026-09-06: the user's voice 0.99 clean / 0.58-0.69 over TTS, a video in
++# the room 0.45-0.52, one other speaker in it 0.57-0.79 on 1-3s bursts.
++_VM_SPEAKER_REJECT = os.environ.get("VOICEMODE_SPEAKER_REJECT", "1") not in ("0", "false", "False")
++_VM_SPEAKER_REJECT_MIN = float(os.environ.get("VOICEMODE_SPEAKER_REJECT_MIN", 0.55))
++_VM_SPEAKER_REJECT_MAX = int(os.environ.get("VOICEMODE_SPEAKER_REJECT_MAX", 2))
++
++
++def _vm_verify_speaker(pcm_bytes: bytes):
++    """Similarity to the enrolled voiceprint, or None if undeterminable.
++
++    None means 'could not tell' (daemon down, no voiceprint). Callers MUST fall
++    back to existing behaviour on None - failing closed would silently discard
++    real speech, which is worse than a long recording.
++    """
++    try:
++        import urllib.request
++        req = urllib.request.Request(_VM_VERIFY_URL, data=pcm_bytes,
++                                     headers={"Content-Type": "application/octet-stream"})
++        with urllib.request.urlopen(req, timeout=1.5) as r:
++            v = float(r.read().decode().split()[0])
++        return None if v < 0 else v
++    except Exception:
++        return None
++
+ def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, stop_event: Optional[threading.Event] = None) -> Tuple[np.ndarray, bool]:
+     """Record audio from microphone with automatic silence detection.
+ 
+@@ -1380,6 +1467,15 @@
+         return (record_audio(max_duration), True)
+     
+     logger.info(f"🎤 Recording with silence detection (max {max_duration}s)...")
++    # Tell the barge-in daemon to stay off the mic. The event log it
++    # otherwise tails lags by a second or more, and in that gap both
++    # processes opened the same CoreAudio device - which is what made
++    # recordings run to max_duration.
++    try:
++        _VM_RECORDING_FLAG.parent.mkdir(parents=True, exist_ok=True)
++        _VM_RECORDING_FLAG.write_text(str(time.time()))
++    except OSError:
++        pass
+     
+     try:
+         # Initialize VAD with provided aggressiveness or default
+@@ -1401,6 +1497,10 @@
+         silence_duration_ms = 0
+         recording_duration = 0
+         speech_detected = False
++        # Rolling ambient estimate for the energy gate above. Per-recording so
++        # a noisy afternoon does not poison a quiet evening.
++        _VM_NOISE_SAMPLES = []
++        _VM_NOISE_FLOOR = 0.0
+         stop_recording = False
+ 
+         # Use a queue for thread-safe communication
+@@ -1537,6 +1637,30 @@
+                         # Check if chunk contains speech
+                         try:
+                             is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
++
++                            # LOCAL PATCH: gate VAD on energy as well.
++                            #
++                            # webrtcvad alone keys on speech-LIKE spectra, not
++                            # loudness. In a quiet room it is accurate (measured
++                            # 0% false positives). In a room with fans/traffic it
++                            # reported speech on 91.8% of frames while nobody was
++                            # talking, so the end-of-turn silence timer never
++                            # reached its threshold and every recording ran to
++                            # max_duration.
++                            #
++                            # The floor is calibrated from the opening of THIS
++                            # recording rather than a constant, so it adapts to
++                            # whatever the room is doing today.
++                            _rms = float(np.sqrt(np.mean(chunk_flat.astype(np.float64) ** 2)))
++                            _VM_NOISE_SAMPLES.append(_rms)
++                            if len(_VM_NOISE_SAMPLES) > 400:
++                                _VM_NOISE_SAMPLES.pop(0)
++                            if len(_VM_NOISE_SAMPLES) >= 20:
++                                _VM_NOISE_FLOOR = max(
++                                    float(np.percentile(_VM_NOISE_SAMPLES[:60], 75)) * 2.0,
++                                    120.0)
++                                if is_speech and _rms < _VM_NOISE_FLOOR:
++                                    is_speech = False
+                             if VAD_DEBUG:
+                                 # Log VAD decision every 500ms for less spam
+                                 if int(recording_duration * 1000) % 500 == 0:
+@@ -1555,8 +1679,23 @@
+                                     logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
+                                 speech_detected = True
+                                 silence_duration_ms = 0
+-                            # No timeout in this state - just keep waiting
+-                            # The only exit is speech detection or max_duration
++                            # LOCAL PATCH: bail out if NO speech is ever heard.
++                            #
++                            # Upstream waits the entire max_duration in this
++                            # state. With max_duration raised to 180s, and a
++                            # barge-in handover that opens the mic AFTER the
++                            # user has finished their sentence, that means the
++                            # mic sits open for three minutes having heard
++                            # nothing - which reads as "it never stops
++                            # listening". Give up after a bounded wait instead;
++                            # the caller already handles the no-speech outcome
++                            # gracefully.
++                            elif recording_duration >= NO_SPEECH_TIMEOUT:
++                                logger.info(
++                                    f"✗ No speech heard in {NO_SPEECH_TIMEOUT}s - "
++                                    f"ending recording instead of waiting out "
++                                    f"max_duration ({max_duration}s)")
++                                break
+                         else:
+                             # We have detected speech at some point
+                             if is_speech:
+@@ -1573,6 +1712,18 @@
+                                 # Check if we should stop due to silence threshold
+                                 # Use the larger of MIN_RECORDING_DURATION (global) or min_duration (parameter)
+                                 effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
++                                # About to end on silence: if the recent audio
++                                # IS the enrolled speaker he is likely pausing
++                                # mid-sentence, so give him longer. If it is
++                                # anything else, the silence stands.
++                                if (_VM_SPEAKER_GATE and speech_detected
++                                        and silence_duration_ms >= SILENCE_THRESHOLD_MS
++                                        and len(chunks) > 40):
++                                    _tail = np.concatenate(chunks[-50:]).astype(np.int16).tobytes()
++                                    _sim = _vm_verify_speaker(_tail)
++                                    if _sim is not None and _sim >= _VM_SPEAKER_MIN:
++                                        silence_duration_ms = int(SILENCE_THRESHOLD_MS * 0.5)
++                                        logger.debug(f"speaker present (sim={_sim:.2f}) - extending")
+                                 if recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                     logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
+                                     if VAD_DEBUG:
+@@ -1594,6 +1745,11 @@
+             
+             # Concatenate all chunks
+             if chunks:
++                # Prepend anything the barge-in daemon captured before it cut
++                # playback, so the start of the interrupting phrase survives.
++                _pre = _consume_bargein_preroll(SAMPLE_RATE)
++                if _pre is not None and _pre.size:
++                    chunks.insert(0, _pre)
+                 full_recording = np.concatenate(chunks)
+                 
+                 if not speech_detected:
+@@ -1611,6 +1767,10 @@
+                     logger.debug(f"Recording stats - RMS: {rms:.2f}, Speech detected: {speech_detected}")
+                 
+                 # Return tuple: (audio_data, speech_detected)
++                try:
++                    _VM_RECORDING_FLAG.unlink(missing_ok=True)
++                except OSError:
++                    pass
+                 return (full_recording, speech_detected)
+             else:
+                 logger.warning("No audio chunks recorded")
+@@ -1975,13 +2135,28 @@
+     # executor future again after that, so its eventual (now fast) result is
+     # simply discarded.
+     stop_event = threading.Event()
+-    try:
+-        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+-            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, stop_event
+-        )
+-    except asyncio.CancelledError:
+-        stop_event.set()
+-        raise
++    _vm_rejects = 0
++    while True:
++        try:
++            audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
++                None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, stop_event
++            )
++        except asyncio.CancelledError:
++            stop_event.set()
++            raise
++        # Speaker filter (see _VM_SPEAKER_REJECT). None from the verifier means
++        # "could not tell" (daemon down): fall through, never fail closed.
++        if (_VM_SPEAKER_REJECT and speech_detected and _vm_rejects < _VM_SPEAKER_REJECT_MAX
++                and len(audio_data) >= SAMPLE_RATE // 2):
++            _sim = _vm_verify_speaker(np.asarray(audio_data).astype(np.int16).tobytes())
++            if _sim is not None and _sim < _VM_SPEAKER_REJECT_MIN:
++                _vm_rejects += 1
++                logger.info(f"speaker filter: dropped take {_vm_rejects} (similarity {_sim:.2f} < "
++                            f"{_VM_SPEAKER_REJECT_MIN}) - not the enrolled voice, listening again")
++                continue
++            if _sim is not None:
++                logger.info(f"speaker filter: accepted (similarity {_sim:.2f})")
++        break
+     timings['record'] = time.perf_counter() - record_start
+ 
+     if event_logger:
