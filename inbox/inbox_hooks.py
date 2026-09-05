@@ -548,7 +548,12 @@ def is_important(item):
 
 # ---- Persistence + delivery -------------------------------------------------
 def _claude_running():
-    return subprocess.run(["pgrep", "-x", "Claude"], capture_output=True).returncode == 0
+    """True if the Claude desktop app is running (macOS, Linux, Windows)."""
+    if sys.platform.startswith("win"):
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Claude.exe"], capture_output=True, text=True).stdout
+        return "Claude.exe" in out
+    name = "Claude" if sys.platform == "darwin" else "claude"
+    return subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0
 
 
 def _wa_send(phone, message):

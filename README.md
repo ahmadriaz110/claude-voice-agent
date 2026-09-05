@@ -94,6 +94,19 @@ In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ..
 
 The receiver expects a small local Baileys bridge on `127.0.0.1:47823` with these routes: `GET /status`, `GET /qr` (also writes a PNG), `POST /send {phone, message}`, `GET /chats`, `GET /messages?phone=&limit=` (each item with `id`, `type`, `from`, `text`, `timestamp`), `GET /media?phone=&id=` (raw bytes + content type), and `POST /webhooks {url, events, secret}` delivering `{event, timestamp, data:{chatJid,isGroup,fromMe,author,text,messageId,timestamp,type}}` signed with `X-WA-Signature: sha256=<hmac>`. `whatsapp-bridge/daemon.js.patch` adds the `/media` route and the `id`/`type` fields to a bridge built on [Baileys](https://github.com/WhiskeySockets/Baileys) with `syncFullHistory: true`. Link the device by scanning the QR from `tools/qr_render.py`'s image or the bridge's PNG; a phone-side "couldn't link" usually means a second copy of the bridge is fighting for the port, or a stale session directory.
 
+## Windows and Linux
+
+| Part | Status |
+|---|---|
+| `inbox/inbox_hooks.py`, backfills, `tools/` | Plain Python. Run on Windows (native or WSL) and Linux. Install as a service with Task Scheduler / NSSM on Windows, systemd on Linux (the launchd templates show the two commands). |
+| WhatsApp bridge | Node, runs anywhere. |
+| whisper / Kokoro | Already run on Windows in the reference setup (GPU box). |
+| `daemon/bargein_daemon.py`, ears | sounddevice, webrtcvad, resemblyzer and the whisper calls all work on Windows. Must run natively, not in WSL, to reach the microphone and the app. |
+| `daemon/bargein_daemon.py`, hands | macOS only today: the Accessibility API and CGEvent code that finds the Claude composer, clicks a sidebar row and pastes. A Windows port needs UI Automation plus SendInput and a clipboard file-drop for attachments. Planned. |
+| `daemon/voicemode_indicator.py` | macOS menu bar (rumps). A tray-icon equivalent (pystray) is planned. |
+| `daemon/launcher.c` | macOS TCC only; not needed elsewhere. |
+| voice-mode converse loop on Windows | Not verified yet. |
+
 ## Privacy and safety
 
 - Everything stays local except Graph/WhatsApp traffic to their own services and STT/TTS to endpoints you choose.
