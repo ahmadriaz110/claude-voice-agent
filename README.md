@@ -102,10 +102,37 @@ The receiver expects a small local Baileys bridge on `127.0.0.1:47823` with thes
 | WhatsApp bridge | Node, runs anywhere. |
 | whisper / Kokoro | Already run on Windows in the reference setup (GPU box). |
 | `daemon/bargein_daemon.py`, ears | sounddevice, webrtcvad, resemblyzer and the whisper calls all work on Windows. Must run natively, not in WSL, to reach the microphone and the app. |
-| `daemon/bargein_daemon.py`, hands | macOS only today: the Accessibility API and CGEvent code that finds the Claude composer, clicks a sidebar row and pastes. A Windows port needs UI Automation plus SendInput and a clipboard file-drop for attachments. Planned. |
-| `daemon/voicemode_indicator.py` | macOS menu bar (rumps). A tray-icon equivalent (pystray) is planned. |
+| `daemon/bargein_daemon.py`, hands | macOS only today: the Accessibility API and CGEvent code that finds the Claude composer, clicks a sidebar row and pastes. See the porting guide below. |
+| `daemon/voicemode_indicator.py` | macOS menu bar (rumps). A tray-icon equivalent with `pystray` is a natural port. |
 | `daemon/launcher.c` | macOS TCC only; not needed elsewhere. |
 | voice-mode converse loop on Windows | Not verified yet. |
+
+### Porting the daemon's hands to Windows (guide, not done yet)
+
+The macOS-specific code is confined to a handful of functions in `daemon/bargein_daemon.py`. Everything else in the daemon is portable Python.
+
+| Function | What it does on macOS | Windows equivalent |
+|---|---|---|
+| `_native_paste(text)` | Activates the Claude app, finds the composer (`_ax_find_composer`: an `AXTextArea` whose description or class mentions prompt / ProseMirror), sets focus, puts text on the pasteboard, sends Cmd+V and Return with `CGEvent` | `uiautomation` (or `pywinauto` with the `uia` backend): find the Edit control inside the Claude window, `SetFocus()`, set the clipboard with `pywin32` (`win32clipboard`), send Ctrl+V and Enter with `SendInput` (`pyautogui` or `keyboard`) |
+| `_ax_find_titled(pid, title)` + `_ax_press(el)` | Breadth-first search of the window's accessibility tree for a sidebar entry by title, then `AXPress` or a click at its centre | Walk the UIA tree for a `ListItem` / `Button` whose `Name` contains the title, then `Invoke()` or click its bounding rectangle |
+| `switch_session(path)` | Clicks a tab, then a row ("Chat and Cowork>My chat") | Same two-step, with the UIA names your app build shows; dump them once with the tool in the next row |
+| `@@axtitles` handler | Dumps every labelled element to `ax_dump.txt` so you can learn the current labels | `uiautomation.EnumAndLogControl` or `pywinauto`'s `print_control_identifiers()` |
+| `_native_attach(path)` | Puts a file URL on the pasteboard and pastes it, which the composer takes as an attachment | Set the clipboard to `CF_HDROP` with the file path (`win32clipboard`, `DROPFILES` struct) and send Ctrl+V; or drive the paperclip button through UIA and the file dialog |
+| `launch_session()` fallback | `open claude://code/new?q=...` when the app is not running | `start claude://code/new?q=...` |
+| `_start_verify_server`, `is_user_speaking`, wake and barge-in loops | Portable | Unchanged; `sounddevice` picks the mic by name via `BARGEIN_MIC_NAME` |
+| `fire()` | Calls `voicemode control skip-forward` (voice-mode's control socket) | Same command if voice-mode runs on Windows; verify that first |
+
+How to test a port, piece by piece:
+
+1. `python bargein_daemon.py` with `BARGEIN_WAKE=0` and speak over TTS: confirms audio, VAD and the voiceprint on your machine.
+2. Write `@@axtitles` into `inject.txt`: confirms you can read the app's control tree; use the dump to set `BARGEIN_HOME_SESSION`.
+3. Write a plain line into `inject.txt`: confirms focus + paste into the composer.
+4. Write `@@session=<Tab>><Row>;back=<Tab>><Row>;file=<path>;msg=hello`: confirms sidebar navigation and the attachment.
+5. Only then enable the wake word and barge-in.
+
+Run the daemon natively on Windows (not WSL): the microphone and the app's UI tree are only reachable from a Windows process. The receiver can live in WSL or natively.
+
+If you port it, please open an issue or a pull request with your UIA control names and what you changed; that is the fastest way for the next person.
 
 ## Privacy and safety
 
