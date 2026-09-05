@@ -102,7 +102,7 @@ IMPORTANT_WORDS = ("urgent", "asap", "deadline", "invoice", "payment", "quote",
 
 _lock = threading.Lock()
 _last_inject = 0.0
-_inject_buf = []
+_inject_buf = []          # list of (line, auto_escalate)
 _chat_topic_cache = {}
 _seen_ids = []
 _state = {"started": time.time(), "events": 0, "last_event": None,
@@ -587,7 +587,9 @@ def _flush_inject():
     global _last_inject, _inject_buf
     if not _inject_buf:
         return
-    lines = _inject_buf; _inject_buf = []
+    items = _inject_buf; _inject_buf = []
+    lines = [l for l, _ in items]
+    auto = any(e for _, e in items)
     text = "[inbox] " + (" | ".join(lines) if len(lines) > 1 else lines[0])
     if not _claude_running():
         with open(PENDING, "a") as f:
@@ -599,7 +601,10 @@ def _flush_inject():
     INJECT_FILE.write_text(text[:1500])
     _last_inject = time.time()
     log(f"inject: {text[:120]!r}")
-    threading.Timer(ESCALATE_AFTER_S, _escalate_if_unacked, [time.time(), text]).start()
+    if auto:
+        threading.Timer(ESCALATE_AFTER_S, _escalate_if_unacked, [time.time(), text]).start()
+    else:
+        log("inject: conversation-first item; escalation left to the agent")
 
 
 def _inject_later():
@@ -702,7 +707,12 @@ def record(item):
         _state["events"] += 1
         _state["last_event"] = item["received"]
         if important:
-            _inject_buf.append(_summary_line(item, why))
+            # Mentions and direct messages on Teams/WhatsApp: the agent replies as
+            # the user and asks what is needed first (the user's rule, 2026-09-06). Mail
+            # alerts and the unanswered-request sweep still escalate automatically.
+            conversational = item["channel"] in ("teams", "whatsapp") and why in (
+                "direct message", "you were mentioned", "your instruction via WhatsApp")
+            _inject_buf.append((_summary_line(item, why), not conversational))
             _inject_later()
     render_today()
     log(f"{item['channel']}: {'IMPORTANT ' if important else ''}{item.get('from')} -> {item.get('text','')[:80]!r} [{why}]")
