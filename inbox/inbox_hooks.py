@@ -807,9 +807,14 @@ class H(BaseHTTPRequestHandler):
                 continue
             res = n.get("resource", "")
             try:
-                if "/messages/" in res.lower() and res.lower().startswith("chats/"):
+                # Chat notifications arrive as chats('<id>')/messages('<id>'), mail as
+                # Users/<id>/Messages/<id>. The old test looked for "chats/" only, so
+                # every Teams event was fetched as mail and rejected (toRecipients is
+                # not a chatMessage property): chat push was silently dropped.
+                low = res.lower()
+                if low.startswith("chats(") or low.startswith("chats/") or "/chats/" in low:
                     record(fetch_chat(res))
-                elif "/messages" in res.lower():
+                elif "/messages" in low:
                     record(fetch_mail(res))
                 else:
                     log(f"graph: unhandled resource {res}")

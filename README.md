@@ -13,6 +13,10 @@ A hands-free, always-listening voice agent for **Claude Code on the Claude deskt
 
 Everything runs on the Mac. Speech-to-text and text-to-speech are OpenAI-compatible local endpoints (whisper.cpp / Kokoro via [voice-mode](https://github.com/mbailey/voicemode)); a LAN GPU box can serve whisper `large-v3`.
 
+## What it feels like, honestly
+
+Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it talks back, you can cut it off mid-sentence, and you can hand it things while it works. The difference is latency. This is turn-based, not a streaming duplex model: after you stop speaking it takes one to three seconds before Claude starts answering, and a command injected while it is busy surfaces a few seconds later, at its next step. Long thinking is the biggest wait, not speech. In exchange you get the full Claude Code toolset behind the voice, everything running locally, and no per-minute bill.
+
 ## Architecture
 
 ```
