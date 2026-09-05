@@ -151,7 +151,9 @@ If you port it, please open an issue or a pull request with your UIA control nam
 
 ## Credits
 
-[voice-mode](https://github.com/mbailey/voicemode) (MCP voice loop), [resemblyzer](https://github.com/resemble-ai/Resemblyzer), [Baileys](https://github.com/WhiskeySockets/Baileys), whisper.cpp, Kokoro.
+Built on [voice-mode](https://github.com/mbailey/voicemode) (the MCP voice loop and its control channel), [resemblyzer](https://github.com/resemble-ai/Resemblyzer), [webrtcvad](https://github.com/wiseman/py-webrtcvad), [Baileys](https://github.com/WhiskeySockets/Baileys), whisper.cpp and [Kokoro](https://github.com/hexgrad/kokoro).
+
+Inspiration, read but not used: [aayushdebugging/claude-voice](https://github.com/aayushdebugging/claude-voice), which showed that barge-in with Claude on a local, zero-cost stack was practical, and the interruption handling in [Pipecat](https://github.com/pipecat-ai/pipecat) and [LiveKit Agents](https://github.com/livekit/agents).
 
 ## License
 
