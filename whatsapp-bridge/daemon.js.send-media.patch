@@ -1,0 +1,24 @@
+--- a/daemon.js
++++ b/daemon.js
+@@ -370,8 +370,20 @@
+     if (route === 'POST /send') {
+       if (!isConnected) return send(res, 409, { error: 'not connected' });
+       const body = await readJson(req);
+-      if (!body.phone || !body.message) return send(res, 400, { error: 'phone and message required' });
++      if (!body.phone || (!body.message && !body.image && !body.document)) return send(res, 400, { error: 'phone and message (or image / document path) required' });
+       const jid = toJid(body.phone);
++      // Optional media: `image` or `document` is an absolute path on this machine;
++      // `message` becomes the caption. Text-only sends are unchanged.
++      if (body.image) {
++        if (!fs.existsSync(body.image)) return send(res, 400, { error: 'image path not found' });
++        await sock.sendMessage(jid, { image: fs.readFileSync(body.image), caption: body.message || body.caption || '' });
++        return send(res, 200, { ok: true, to: body.phone, jid, media: 'image', bytes: fs.statSync(body.image).size });
++      }
++      if (body.document) {
++        if (!fs.existsSync(body.document)) return send(res, 400, { error: 'document path not found' });
++        await sock.sendMessage(jid, { document: fs.readFileSync(body.document), fileName: path.basename(body.document), mimetype: body.mimetype || 'application/octet-stream', caption: body.message || body.caption || '' });
++        return send(res, 200, { ok: true, to: body.phone, jid, media: 'document' });
++      }
+       await sock.sendMessage(jid, { text: body.message });
+       return send(res, 200, { ok: true, to: body.phone, jid });
+     }

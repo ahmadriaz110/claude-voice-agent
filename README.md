@@ -85,6 +85,8 @@ In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ..
 | **"Give All CVs this file and tell it to translate it"** | Daemon opens the *Chat and Cowork* tab, clicks the "All CVs" row, pastes the file as an attachment, types the instruction, returns to your Code session; the chat saves its output to a folder you watch |
 | "Brief me" / "what came in" | The agent reads `today.md` and speaks the important items first |
 | "What's pending?" | `tasks.py list open`, read aloud |
+| "Answer me in Urdu" | The whole reply is spoken by Kokoro's Hindi voice (`hf_alpha`), written by the agent in Devanagari, so no transliteration step. One language per reply; mixed-language input is whisper's job. The Perso-Arabic sounds flatten to their Hindi neighbours |
+| A WhatsApp message from your second number | Treated as an instruction (text or voice note). Results, including files and images, go back to that number through the bridge's `/send` |
 
 ## Speaker verification and interrupts
 
@@ -109,7 +111,7 @@ On the listening side the patched `converse.py` takes its noise floor from non-s
 
 ## WhatsApp bridge
 
-The receiver expects a small local Baileys bridge on `127.0.0.1:47823` with these routes: `GET /status`, `GET /qr` (also writes a PNG), `POST /send {phone, message}`, `GET /chats`, `GET /messages?phone=&limit=` (each item with `id`, `type`, `from`, `text`, `timestamp`), `GET /media?phone=&id=` (raw bytes + content type), and `POST /webhooks {url, events, secret}` delivering `{event, timestamp, data:{chatJid,isGroup,fromMe,author,text,messageId,timestamp,type}}` signed with `X-WA-Signature: sha256=<hmac>`. `whatsapp-bridge/daemon.js.patch` adds the `/media` route and the `id`/`type` fields to a bridge built on [Baileys](https://github.com/WhiskeySockets/Baileys) with `syncFullHistory: true`. Link the device by scanning the QR from `tools/qr_render.py`'s image or the bridge's PNG; a phone-side "couldn't link" usually means a second copy of the bridge is fighting for the port, or a stale session directory.
+The receiver expects a small local Baileys bridge on `127.0.0.1:47823` with these routes: `GET /status`, `GET /qr` (also writes a PNG), `POST /send {phone, message, image?, document?}` (`image` / `document` is a path on this machine, `message` becomes the caption), `GET /chats`, `GET /messages?phone=&limit=` (each item with `id`, `type`, `from`, `text`, `timestamp`), `GET /media?phone=&id=` (raw bytes + content type), and `POST /webhooks {url, events, secret}` delivering `{event, timestamp, data:{chatJid,isGroup,fromMe,author,text,messageId,timestamp,type}}` signed with `X-WA-Signature: sha256=<hmac>`. `whatsapp-bridge/daemon.js.patch` adds the `/media` route and the `id`/`type` fields, and `daemon.js.send-media.patch` adds image and document sending, to a bridge built on [Baileys](https://github.com/WhiskeySockets/Baileys) with `syncFullHistory: true`. Link the device by scanning the QR from `tools/qr_render.py`'s image or the bridge's PNG; a phone-side "couldn't link" usually means a second copy of the bridge is fighting for the port, or a stale session directory.
 
 ## Windows and Linux
 
@@ -167,6 +169,7 @@ If you port it, please open an issue or a pull request with your UIA control nam
 - Sidebar navigation depends on the app's accessibility labels ("Chat and Cowork", row titles); an app update may rename them. `@@axtitles` dumps the current labels.
 - WhatsApp calls cannot be placed by any unofficial library. Old WhatsApp media may fail to download (expired on WhatsApp's servers).
 - Patches target voice-mode 8.12.0 exactly.
+- Kokoro's Hindi voices work through the plain `converse` message path (`voice="hf_alpha"`). Inside a pipelined `turns` survey the same voice comes back as `tts_failed` before any request reaches Kokoro; speak Urdu replies as single calls.
 
 ## Credits
 

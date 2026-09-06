@@ -544,9 +544,17 @@ def transcribe_clip(frames_bytes, language="en", prompt="Hey Claude."):
               headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         raw = urllib.request.urlopen(req, timeout=8).read().decode("utf-8", "replace")
         try:
-            return (_j.loads(raw).get("text") or "").strip()
+            text = (_j.loads(raw).get("text") or "").strip()
         except Exception:
-            return raw.strip()
+            text = raw.strip()
+        # The user speaks English, Urdu and Punjabi, never Hindi. On auto-detect
+        # Whisper renders Urdu as Hindi (Devanagari) or Punjabi (Gurmukhi);
+        # rerun once forced to Urdu so the command is in Urdu script, the
+        # same rule voice-mode applies in simple_failover.
+        if language is None and any("\u0900" <= ch <= "\u0a7f" for ch in text):
+            log(f"stt: Devanagari/Gurmukhi on auto-detect, rerunning as Urdu ({text[:30]!r})")
+            return transcribe_clip(frames_bytes, language="ur", prompt=None)
+        return text
     except Exception as e:
         log(f"wake transcribe failed: {e}")
         return ""
