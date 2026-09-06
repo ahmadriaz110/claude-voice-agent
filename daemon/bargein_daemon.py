@@ -763,6 +763,21 @@ def _fmt_cand(c):
             f'desc={c["desc"]!r} title={c["title"]!r} val={c["val"]!r}')
 
 
+PASTE_FOREGROUND = os.environ.get("BARGEIN_PASTE_FOREGROUND", "0") not in ("0", "", "false", "False")
+
+
+def _key_to_pid(pid, code, flags=0):
+    """Post a keystroke to one process only, so the app need not be in front.
+    This is what lets a message land in Claude while the user keeps working
+    in another window."""
+    import Quartz as Q
+    for down in (True, False):
+        ev = Q.CGEventCreateKeyboardEvent(None, code, down)
+        Q.CGEventSetFlags(ev, flags)
+        Q.CGEventPostToPid(pid, ev)
+        time.sleep(0.02)
+
+
 def _key(code, flags=0):
     import Quartz as Q
     for down in (True, False):
@@ -902,11 +917,17 @@ def _native_paste(text, dry_run=False):
         return False, "Claude not running"
     app = apps[0]
     pid = app.processIdentifier()
-    app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-    for _ in range(20):
-        if app.isActive():
-            break
-        time.sleep(0.05)
+    # Background delivery by default: the composer is focused over AX and the
+    # keystrokes are posted to Claude's own process, so whatever the user is
+    # working in stays in front. BARGEIN_PASTE_FOREGROUND=1 restores the old
+    # behaviour of bringing the window forward first.
+    fg = PASTE_FOREGROUND
+    if fg:
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        for _ in range(20):
+            if app.isActive():
+                break
+            time.sleep(0.05)
 
     ax_app = AS.AXUIElementCreateApplication(pid)
     # A backgrounded Electron app can take seconds to answer AX queries; the
@@ -968,6 +989,35 @@ def _native_paste(text, dry_run=False):
     else:
         report.append("composer: cached")
 
+    if not fg and not dry_run:
+        # Background route, measured 2026-09-06 16:07 with Finder in front:
+        # the composer accepts its value over AX and a Return posted to the
+        # process submits it. No activation, no clipboard, nothing on top of
+        # the user changes. Falls through to the foreground paste only when
+        # the value did not take or the Return did not submit.
+        try:
+            rc = AS.AXUIElementSetAttributeValue(el, AS.kAXValueAttribute, text)
+            time.sleep(0.25)
+            got = str(_ax_attr(el, AS.kAXValueAttribute) or "")
+            if rc == 0 and text[:40] in got:
+                _key_to_pid(pid, 36, 0)
+                time.sleep(0.6)
+                after = str(_ax_attr(el, AS.kAXValueAttribute) or "")
+                if text[:40] not in after:
+                    return True, "ok (background)"
+                report.append("background: Return did not submit; foreground fallback")
+            else:
+                report.append(f"background: AXValue set rc={rc}; foreground fallback")
+        except Exception as e:
+            report.append(f"background: failed ({e}); foreground fallback")
+        log("paste: background route failed, bringing Claude forward for this one")
+        fg = True
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        for _ in range(20):
+            if app.isActive():
+                break
+            time.sleep(0.05)
+
     def focused_now():
         fe = _ax_attr(ax_app, AS.kAXFocusedUIElementAttribute)
         try:
@@ -978,12 +1028,23 @@ def _native_paste(text, dry_run=False):
     AS.AXUIElementSetAttributeValue(el, AS.kAXFocusedAttribute, True)
     time.sleep(0.1)
     how = "AXFocused"
-    if not focused_now():
+    if not focused_now() and fg:
+        # A screen click is only safe when Claude is in front; in background
+        # mode it would land on whatever window the user has on top.
         pt, sz = _ax_point(el), _ax_size(el)
         if pt and sz:
             _click(pt[0] + sz[0] / 2, pt[1] + min(sz[1] / 2, 20))
             time.sleep(0.15)
             how = "click"
+    if not focused_now() and not fg:
+        # Second attempt without stealing focus: raise the window inside the
+        # app (not above other apps) and ask for focus again.
+        try:
+            AS.AXUIElementSetAttributeValue(el, AS.kAXFocusedAttribute, True)
+            time.sleep(0.15)
+            how = "AXFocused (2nd)"
+        except Exception:
+            pass
     ok = focused_now()
     report.append(f"focus via {how}: {'OK' if ok else 'NOT focused'}")
     if dry_run:
@@ -993,12 +1054,31 @@ def _native_paste(text, dry_run=False):
         AX_DUMP_PATH.write_text("\n".join(report) + "\n")
         return False, "could not focus composer"
     pb = NSPasteboard.generalPasteboard()
+    prev = None
+    try:
+        prev = pb.stringForType_(NSPasteboardTypeString)
+    except Exception:
+        pass
     pb.clearContents()
     pb.setString_forType_(text, NSPasteboardTypeString)
     time.sleep(0.05)
-    _key(9, Q.kCGEventFlagMaskCommand)     # cmd+V
-    time.sleep(0.15)
-    _key(36, 0)                            # Return
+    if fg:
+        _key(9, Q.kCGEventFlagMaskCommand)     # cmd+V
+        time.sleep(0.15)
+        _key(36, 0)                            # Return
+    else:
+        _key_to_pid(pid, 9, Q.kCGEventFlagMaskCommand)
+        time.sleep(0.2)
+        _key_to_pid(pid, 36, 0)
+    if prev is not None:
+        # Give the user his clipboard back once the paste has been taken.
+        def _restore():
+            time.sleep(0.8)
+            try:
+                pb.clearContents(); pb.setString_forType_(prev, NSPasteboardTypeString)
+            except Exception:
+                pass
+        threading.Thread(target=_restore, daemon=True).start()
     return True, "ok"
 
 

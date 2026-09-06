@@ -75,6 +75,7 @@ In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ..
 
 | Say / do | What happens |
 |---|---|
+| Any message delivered to the session (`[voice]`, `[inbox]`) | Lands in the background: the composer takes the text over accessibility and a Return is posted to Claude's process, so whatever you are working in stays in front and your clipboard is untouched. Only if that fails does the daemon bring Claude forward and paste (`BARGEIN_PASTE_FOREGROUND=1` forces the old way) |
 | **"Hey Claude, open Amazon and YouTube in two tabs"** while Claude is busy | Wake word verified against your voiceprint, the whole sentence transcribed, pasted into the running session as `[voice] ...`; Claude's current speech or listen window is cut so it reads it within seconds |
 | Talk over Claude mid-sentence | Barge-in, verified against your ECAPA voiceprint and relative to the TTS voice, stop sent straight to voice-mode's control socket (well under a second). If that turn was going to listen, the mic is handed to voice-mode (red icon). If it was not, the daemon records you itself (icon red as well) and injects the words |
 | "Hey Claude" alone | Pastes the resume prompt into the existing session (context kept). A 4 s window accepts a follow-up command as the sentence |
