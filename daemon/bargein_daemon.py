@@ -1211,7 +1211,61 @@ def _retry_tick():
             launch_session(it["text"], _retry=True)
 
 
-def launch_session(text=WAKE_PROMPT, _retry=False):
+HOME_TITLE = os.environ.get("BARGEIN_HOME_SESSION", "Code>My voice session").split(">")[-1].strip()
+
+
+def _current_session_title(pid):
+    """Title of the session showing in the main pane. Its header is an
+    AXButton described "<title>, rename session"."""
+    import ApplicationServices as AS
+    from collections import deque
+    app = AS.AXUIElementCreateApplication(pid)
+    q = deque(list(_ax_attr(app, AS.kAXWindowsAttribute) or []))
+    n = 0
+    while q and n < AX_MAX_NODES:
+        el = q.popleft(); n += 1
+        if _ax_attr(el, AS.kAXRoleAttribute) == "AXButton":
+            d = str(_ax_attr(el, AS.kAXDescriptionAttribute) or "")
+            if d.endswith(", rename session"):
+                return d[:-len(", rename session")]
+        for k in (_ax_attr(el, AS.kAXChildrenAttribute) or []):
+            q.append(k)
+    return None
+
+
+def _ensure_home_session(pid):
+    """Every injected message belongs to the voice-agent session, whichever
+    session the user left in front. A CV sent from his phone once landed in
+    an unrelated Code session that did nothing with it. Select
+    the home session over AX, without activating the app."""
+    if not HOME_TITLE:
+        return True
+    cur = _current_session_title(pid)
+    if cur == HOME_TITLE:
+        return True
+    log(f"route: session showing is {cur!r}; selecting {HOME_TITLE!r}")
+    el = _ax_find_titled(pid, HOME_TITLE)
+    if el is None:
+        tab = _ax_find_titled(pid, "Code")
+        if tab is not None:
+            _ax_press(tab)
+            time.sleep(0.8)
+            el = _ax_find_titled(pid, HOME_TITLE)
+    if el is None:
+        log("route: home session row not found in the sidebar")
+        return False
+    _ax_press(el)
+    _composer_cache["el"] = None
+    for _ in range(12):
+        time.sleep(0.3)
+        if _current_session_title(pid) == HOME_TITLE:
+            log(f"route: now on {HOME_TITLE!r}")
+            return True
+    log(f"route: could not select {HOME_TITLE!r} (showing {_current_session_title(pid)!r})")
+    return False
+
+
+def launch_session(text=WAKE_PROMPT, _retry=False, home=True):
     """Type `text` into the CURRENT Claude session and send it.
 
     While Claude is mid-turn the desktop app queues the message, which is
@@ -1249,6 +1303,14 @@ def launch_session(text=WAKE_PROMPT, _retry=False):
         log("WAKE: Claude was not running - opened a new session")
         return
 
+    if home and HOME_TITLE:
+        try:
+            from AppKit import NSRunningApplication as _NRA
+            _apps = _NRA.runningApplicationsWithBundleIdentifier_(CLAUDE_BUNDLE)
+            if _apps:
+                _ensure_home_session(_apps[0].processIdentifier())
+        except Exception as _e:
+            log(f"route: check failed ({_e})")
     ok, why = _native_paste(text)
     if ok and text != WAKE_PROMPT:
         _inject_at[0] = time.time()
@@ -1605,7 +1667,7 @@ def main():
                                 close_stream()
                                 for f in [x for x in parts.get("file", "").split("|") if x]:
                                     _native_attach(f)
-                                launch_session(msg)
+                                launch_session(msg, home=False)     # meant for that chat, not the home session
                                 _cut_tts_until[0] = 0.0     # not for this session
                                 log(f"inject: typed into session {target!r}")
                                 if back:
