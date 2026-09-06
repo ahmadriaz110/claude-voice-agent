@@ -917,6 +917,52 @@ def _native_paste(text, dry_run=False):
         return False, "Claude not running"
     app = apps[0]
     pid = app.processIdentifier()
+    # Remember what the user was working in, so focus can be handed back if
+    # Claude ends up in front (a reopened window raises itself; the
+    # foreground fallback activates on purpose).
+    def _front_pid():
+        # The owner of the topmost normal window. NSWorkspace is stale in a
+        # process without a run loop, and the AX system-wide focused app
+        # cannot complete against some apps (Chrome: -25204). The window
+        # list has been right every time.
+        try:
+            wl = Q.CGWindowListCopyWindowInfo(Q.kCGWindowListOptionOnScreenOnly | Q.kCGWindowListExcludeDesktopElements, Q.kCGNullWindowID)
+            for w in wl:
+                if w.get("kCGWindowLayer") == 0 and (w.get("kCGWindowBounds") or {}).get("Height", 0) > 100:
+                    return int(w.get("kCGWindowOwnerPID"))
+        except Exception:
+            pass
+        return None
+    try:
+        _fp = _front_pid()
+        prev_front = NSRunningApplication.runningApplicationWithProcessIdentifier_(_fp) if _fp and _fp != pid else None
+    except Exception as _e:
+        log(f"paste: could not read the front app ({_e})")
+        prev_front = None
+    if not dry_run:
+        log(f"paste: front app before = {prev_front.localizedName() if prev_front is not None else 'Claude/none'}")
+    def _give_focus_back():
+        """A reopened window raises itself a moment after the paste, so watch
+        for up to 3 s and hand focus back the moment Claude comes to the front."""
+        if prev_front is None or dry_run:
+            return
+        def _watch():
+            t0 = time.time()
+            while time.time() - t0 < 3.0:
+                try:
+                    if _front_pid() == pid:
+                        time.sleep(0.2)
+                        prev_front.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+                        time.sleep(0.5)
+                        back = _front_pid() == prev_front.processIdentifier()
+                        log(f"paste: focus handed back to {prev_front.localizedName()}: {'OK' if back else 'NOT in front yet'}")
+                        return
+                except Exception as _e:
+                    log(f"paste: focus watcher failed ({_e})")
+                    return
+                time.sleep(0.25)
+            log("paste: Claude never came to the front; nothing to hand back")
+        threading.Thread(target=_watch, daemon=True).start()
     # Background delivery by default: the composer is focused over AX and the
     # keystrokes are posted to Claude's own process, so whatever the user is
     # working in stays in front. BARGEIN_PASTE_FOREGROUND=1 restores the old
@@ -944,7 +990,8 @@ def _native_paste(text, dry_run=False):
         return list(_ax_attr(ax_app, AS.kAXWindowsAttribute) or [])
     wins = _windows()
     if not wins:
-        subprocess.run(["open", "-b", CLAUDE_BUNDLE], capture_output=True, timeout=10)
+        # -g: reopen the window without bringing the app to the front.
+        subprocess.run(["open", "-g", "-b", CLAUDE_BUNDLE], capture_output=True, timeout=10)
         for _ in range(30):
             time.sleep(0.2)
             wins = _windows()
@@ -997,17 +1044,34 @@ def _native_paste(text, dry_run=False):
         # the value did not take or the Return did not submit.
         try:
             rc = AS.AXUIElementSetAttributeValue(el, AS.kAXValueAttribute, text)
-            time.sleep(0.25)
-            got = str(_ax_attr(el, AS.kAXValueAttribute) or "")
+            # The value reads back with a lag; judging it after 0.25 s once
+            # caused a foreground re-paste and a doubled message.
+            got = ""
+            for _ in range(6):
+                time.sleep(0.25)
+                got = str(_ax_attr(el, AS.kAXValueAttribute) or "")
+                if text[:40] in got:
+                    break
             if rc == 0 and text[:40] in got:
                 _key_to_pid(pid, 36, 0)
-                time.sleep(0.6)
-                after = str(_ax_attr(el, AS.kAXValueAttribute) or "")
-                if text[:40] not in after:
+                # The composer clears asynchronously; 0.6 s was too short once
+                # and the foreground fallback then sent the line a second time.
+                cleared = False
+                for _ in range(12):
+                    time.sleep(0.25)
+                    if text[:40] not in str(_ax_attr(el, AS.kAXValueAttribute) or ""):
+                        cleared = True
+                        break
+                if cleared:
+                    _give_focus_back()
                     return True, "ok (background)"
-                report.append("background: Return did not submit; foreground fallback")
+                log("paste: background Return did not submit within 3 s; clearing and falling back")
+                try:
+                    AS.AXUIElementSetAttributeValue(el, AS.kAXValueAttribute, "")
+                except Exception:
+                    pass
             else:
-                report.append(f"background: AXValue set rc={rc}; foreground fallback")
+                log(f"paste: background AXValue set rc={rc}, took={text[:40] in got}; falling back")
         except Exception as e:
             report.append(f"background: failed ({e}); foreground fallback")
         log("paste: background route failed, bringing Claude forward for this one")
@@ -1063,6 +1127,8 @@ def _native_paste(text, dry_run=False):
     pb.setString_forType_(text, NSPasteboardTypeString)
     time.sleep(0.05)
     if fg:
+        _key(0, Q.kCGEventFlagMaskCommand)     # cmd+A: replace whatever is in the composer, never append
+        time.sleep(0.1)
         _key(9, Q.kCGEventFlagMaskCommand)     # cmd+V
         time.sleep(0.15)
         _key(36, 0)                            # Return
@@ -1079,6 +1145,7 @@ def _native_paste(text, dry_run=False):
             except Exception:
                 pass
         threading.Thread(target=_restore, daemon=True).start()
+    _give_focus_back()
     return True, "ok"
 
 

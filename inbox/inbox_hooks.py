@@ -672,6 +672,8 @@ def is_important(item):
             return True, "you were mentioned"
         return False, "group chatter"
     if ch == "whatsapp":
+        if re.match(r"^\[(senderKeyDistributionMessage|protocolMessage|reactionMessage|ephemeralMessage)\]$", text.strip()):
+            return False, "protocol noise"
         if item.get("from_other_phone") and not item.get("from_me"):
             item["from"] = "the user (other phone)"
             try:
