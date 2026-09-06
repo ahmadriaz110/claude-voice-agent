@@ -909,6 +909,12 @@ def _native_paste(text, dry_run=False):
         time.sleep(0.05)
 
     ax_app = AS.AXUIElementCreateApplication(pid)
+    # A backgrounded Electron app can take seconds to answer AX queries; the
+    # default timeout returned "no windows at all" three times on 2026-09-06.
+    try:
+        AS.AXUIElementSetMessagingTimeout(ax_app, 4.0)
+    except Exception:
+        pass
     el = _composer_cache["el"]
     if el is not None and _ax_attr(el, AS.kAXRoleAttribute) != "AXTextArea":
         el = _composer_cache["el"] = None          # stale after a reload
@@ -916,6 +922,17 @@ def _native_paste(text, dry_run=False):
     if el is None:
         cands, seen, secs = _ax_find_composer(pid)
         report.append(f"search: {seen} nodes in {secs*1000:.0f}ms, {len(cands)} text inputs")
+        if seen == 0:
+            # No window came back from the app at all. Wake it and ask once
+            # more before giving up (three WhatsApp instructions were lost this
+            # way on 2026-09-06 while the app sat idle in the background).
+            try:
+                app.unhide()
+            except Exception:
+                pass
+            time.sleep(1.2)
+            cands, seen, secs = _ax_find_composer(pid)
+            report.append(f"retry after wake: {seen} nodes, {len(cands)} inputs")
         report += ["  " + _fmt_cand(c) for c in cands]
         pick = _pick_composer(cands)
         if pick is None:
@@ -960,7 +977,60 @@ def _native_paste(text, dry_run=False):
     return True, "ok"
 
 
-def launch_session(text=WAKE_PROMPT):
+DELIVERED_MARK = HOME / ".voicemode" / "context" / "delivered"
+RETRY_EVERY_S = float(os.environ.get("BARGEIN_RETRY_EVERY", 30.0))
+RETRY_MAX = int(os.environ.get("BARGEIN_RETRY_MAX", 30))          # 30 x 30 s = 15 min
+NOTIFY_WA = os.environ.get("BARGEIN_NOTIFY_WA", "")               # digits; empty disables
+WA_SEND_URL = os.environ.get("BARGEIN_WA_SEND_URL", "http://127.0.0.1:47823/send")
+_retry_q = []          # [{"text", "attempts", "next_at", "why"}]
+_ax_probe_at = [0.0]
+
+
+def _wa_notify(msg):
+    """Tell the user on WhatsApp when a message could not be delivered to the
+    session. Direct to the bridge; no reply expected."""
+    if not NOTIFY_WA:
+        return
+    try:
+        import urllib.request as _u
+        req = _u.Request(WA_SEND_URL, data=json.dumps({"phone": NOTIFY_WA, "message": msg}).encode(),
+                         headers={"Content-Type": "application/json"})
+        _u.urlopen(req, timeout=15).read()
+        log(f"notify: WhatsApp sent ({msg[:60]!r})")
+    except Exception as e:
+        log(f"notify: WhatsApp send failed ({e})")
+
+
+def _queue_retry(text, why):
+    """An injected message the composer could not take. Never fall through to
+    the blind keystroke path for these: it types into nothing and then the
+    log says sent. Keep the text and retry until the window is reachable."""
+    for it in _retry_q:
+        if it["text"] == text:
+            it["attempts"] += 1
+            it["next_at"] = time.time() + RETRY_EVERY_S
+            it["why"] = why
+            if it["attempts"] >= RETRY_MAX:
+                _retry_q.remove(it)
+                log(f"inject: giving up after {RETRY_MAX} attempts ({why}): {text[:70]!r}")
+                _wa_notify("I could not deliver your last message to the Claude session for 15 minutes "
+                           "(the app window was not reachable). Please open the Claude window and resend it.")
+            else:
+                log(f"inject: retry {it['attempts']}/{RETRY_MAX} in {RETRY_EVERY_S:.0f}s ({why})")
+            return
+    _retry_q.append({"text": text, "attempts": 1, "next_at": time.time() + RETRY_EVERY_S, "why": why})
+    log(f"inject: composer not reachable ({why}); queued for retry every {RETRY_EVERY_S:.0f}s: {text[:70]!r}")
+
+
+def _retry_tick():
+    now = time.time()
+    for it in list(_retry_q):
+        if it["next_at"] <= now:
+            it["next_at"] = now + RETRY_EVERY_S
+            launch_session(it["text"], _retry=True)
+
+
+def launch_session(text=WAKE_PROMPT, _retry=False):
     """Type `text` into the CURRENT Claude session and send it.
 
     While Claude is mid-turn the desktop app queues the message, which is
@@ -1009,6 +1079,19 @@ def launch_session(text=WAKE_PROMPT):
             _cut_tts_until[0] = time.time() + CUT_TTS_WINDOW_S
     if ok:
         log(f"WAKE: sent to existing Claude session (native): {text[:70]!r}")
+        if text != WAKE_PROMPT:
+            try:
+                DELIVERED_MARK.parent.mkdir(parents=True, exist_ok=True)
+                DELIVERED_MARK.write_text(text[:200])
+            except Exception:
+                pass
+            for it in list(_retry_q):
+                if it["text"] == text:
+                    _retry_q.remove(it)
+                    log(f"inject: delivered on retry {it['attempts']}")
+        return
+    if text != WAKE_PROMPT:
+        _queue_retry(text, why)
         return
     log(f"WAKE: native paste failed ({why}); falling back to System Events")
 
@@ -1312,6 +1395,21 @@ def main():
         while True:
             # Manual/debug injection: paste the file's contents as if spoken.
             # Also the only way to exercise the paste path without a mic.
+            _retry_tick()
+            # Evidence probe: every 10 min log what the app exposes over AX,
+            # without activating it, so a "0 nodes" episode can be dated.
+            if time.time() - _ax_probe_at[0] >= 600:
+                _ax_probe_at[0] = time.time()
+                try:
+                    from AppKit import NSRunningApplication as _NRA
+                    _apps = _NRA.runningApplicationsWithBundleIdentifier_(CLAUDE_BUNDLE)
+                    if _apps:
+                        _c, _n, _s = _ax_find_composer(_apps[0].processIdentifier())
+                        log(f"ax probe: {_n} nodes, {len(_c)} inputs in {_s*1000:.0f}ms, retry queue {len(_retry_q)}")
+                    else:
+                        log("ax probe: Claude not running")
+                except Exception as _e:
+                    log(f"ax probe: failed ({_e})")
             if INJECT_FILE.exists():
                 try:
                     _txt = INJECT_FILE.read_text().strip()

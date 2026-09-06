@@ -52,6 +52,8 @@ TOKEN_CACHE = CTX / "msal_cache.json"
 SUBS_FILE = CTX / "subscriptions.json"
 SIGNIN_FILE = CTX / "signin.txt"
 PENDING = CTX / "pending_important.jsonl"
+DELIVERED = CTX / "delivered"          # touched by the daemon on a confirmed paste
+DELIVERY_WATCH_S = float(os.environ.get("INBOX_DELIVERY_WATCH_S", 90))
 INJECT_FILE = HOME / ".voicemode" / "indicator" / "inject.txt"
 # Escalation: if an important item is pushed into the session and he has not
 # responded within ESCALATE_AFTER_S, the same line is sent to his other
@@ -719,6 +721,25 @@ def _escalate_if_unacked(t0, text, force=False):
         log(f"escalation: send failed: {e}")
 
 
+def _check_delivered(t0, text):
+    """Ninety seconds after an instruction from the second phone was handed to
+    the daemon, confirm the daemon actually pasted it. If not, tell the user
+    on that phone; the daemon keeps retrying. Three instructions were lost
+    silently on 2026-09-06 before this existed."""
+    try:
+        ok = DELIVERED.exists() and DELIVERED.stat().st_mtime >= t0
+    except OSError:
+        ok = False
+    if ok:
+        return
+    try:
+        _wa_send(ESCALATE_TO, "Got your message. It reached the Mac, but the Claude session has not picked it up yet. "
+                              "It is being retried; I will reply as soon as it lands.")
+        log("delivery watch: session did not confirm the paste; user notified on WhatsApp")
+    except Exception as e:
+        log(f"delivery watch: notify failed: {e}")
+
+
 def _flush_inject():
     global _last_inject, _inject_buf
     if not _inject_buf:
@@ -741,6 +762,8 @@ def _flush_inject():
         threading.Timer(ESCALATE_AFTER_S, _escalate_if_unacked, [time.time(), text]).start()
     else:
         log("inject: conversation-first item; escalation left to the agent")
+        if "(your instruction via WhatsApp)" in text and ESCALATE_TO:
+            threading.Timer(DELIVERY_WATCH_S, _check_delivered, [time.time(), text]).start()
 
 
 def _inject_later():
