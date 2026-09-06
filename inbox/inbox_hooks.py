@@ -53,11 +53,11 @@ SUBS_FILE = CTX / "subscriptions.json"
 SIGNIN_FILE = CTX / "signin.txt"
 PENDING = CTX / "pending_important.jsonl"
 INJECT_FILE = HOME / ".voicemode" / "indicator" / "inject.txt"
-# Escalation: if an important item is pushed into the session and the user has not
+# Escalation: if an important item is pushed into the session and he has not
 # responded within ESCALATE_AFTER_S, the same line is sent to his other
 # WhatsApp number through the local Baileys daemon (POST /send). "Responded"
 # = ACK_FILE touched after the push: the barge-in daemon touches it whenever
-# it verifies the user's voice, and any reply from that number touches it too.
+# it verifies his voice, and any reply from that number touches it too.
 ACK_FILE = CTX / "ack"
 ESCALATE_TO = os.environ.get("INBOX_ESCALATE_TO", "")            # digits only, e.g. 4915551234567
 ESCALATE_AFTER_S = float(os.environ.get("INBOX_ESCALATE_AFTER", 20))
@@ -79,10 +79,17 @@ QUOTE_WORDS = ("quote", "quotation", "rfq", "request", "pricing", "price", "avai
                "resource", "onsite", "on-site", "estimate", "proposal")
 SWEPT_FILE = CTX / "escalated_requests.json"
 _sweep_count = [0]
+# One subscription pass at a time, and lifecycle events renew ONE subscription
+# instead of triggering a full pass: with 200+ hourly chat subscriptions the
+# old behaviour ran overlapping passes every few seconds and Graph throttled
+# everything (6,759 errors in 25 minutes on 2026-09-06).
+_pass_lock = threading.Lock()
+_pass_requested = [False]
+_throttled_until = [0.0]
 
 PORT = int(os.environ.get("INBOX_PORT", 8898))
 ME_EMAIL = os.environ.get("INBOX_ME_EMAIL", "")          # your mailbox address
-ME_NAMES = tuple(n for n in os.environ.get("INBOX_ME_NAMES", "").lower().split(",") if n)  # e.g. "jane,doe"
+ME_NAMES = ("ahmad", "riaz")
 OWN_DOMAIN = os.environ.get("INBOX_OWN_DOMAIN", ME_EMAIL.split("@")[-1])
 # Microsoft Graph Command Line Tools: a first-party public client that
 # supports device-code sign-in with delegated Graph scopes, so no app
@@ -205,7 +212,20 @@ def _expiry(minutes):
 # even with Chat.Read granted (verified 2026-09-06, scp decoded from the token).
 # Per-chat subscriptions on chats/{id}/messages ARE allowed, so subscribe to
 # the most recently active chats and refresh that list every hour.
-CHAT_TOP = int(os.environ.get("INBOX_CHAT_TOP", 50))
+# Coverage is not a fixed number: every chat active in the last ACTIVE_DAYS gets
+# a live subscription (capped at CHAT_MAX, most recent first), the full chat
+# list is re-read every CHAT_REFRESH_S, and a chat that received a message
+# without a subscription yet (new chat, or dormant one waking up) has its new
+# messages fetched at that refresh and is subscribed from then on. Measured
+# 2026-09-06: 1479 chats total, 239 active in 90 days, 64 in 7 days.
+CHAT_ACTIVE_DAYS = int(os.environ.get("INBOX_CHAT_ACTIVE_DAYS", 90))
+# Graph refused (403) to create more than ~90-95 chat subscriptions for this
+# user, so live push covers the most active chats up to CHAT_MAX and the
+# catch-up below covers every other chat within CATCHUP_S seconds.
+CHAT_MAX = int(os.environ.get("INBOX_CHAT_MAX", 90))
+CATCHUP_S = int(os.environ.get("INBOX_CATCHUP_S", 120))
+CHAT_REFRESH_S = int(os.environ.get("INBOX_CHAT_REFRESH_S", 600))
+CATCHUP_FILE = CTX / "catchup_state.json"
 # Mail folders to watch. Rules move client mail (e.g. HCL) out of the Inbox,
 # so a subscription on the Inbox alone misses it. Names are resolved to ids
 # at the top level and one level under the Inbox.
@@ -242,18 +262,103 @@ _chat_list_at = 0.0
 _chat_list = []
 
 
+def _all_chats():
+    """Every chat, newest activity first: [(id, topic, last_message_iso)]."""
+    out = []
+    url = "me/chats?$top=50&$select=id,topic,chatType&$expand=lastMessagePreview"
+    while url:
+        page = graph("GET", url)
+        for c in page.get("value", []):
+            last = ((c.get("lastMessagePreview") or {}).get("createdDateTime")) or ""
+            out.append((c["id"], c.get("topic") or c.get("chatType") or "chat", last))
+        url = page.get("@odata.nextLink")
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out
+
+
 def chat_targets():
+    """Chats to subscribe to: active within CHAT_ACTIVE_DAYS, capped at CHAT_MAX.
+    Refreshes the full list every CHAT_REFRESH_S and runs the catch-up."""
     global _chat_list_at, _chat_list
-    if time.time() - _chat_list_at < 3600 and _chat_list:
+    if time.time() - _chat_list_at < CHAT_REFRESH_S and _chat_list:
         return _chat_list
-    res = graph("GET", f"me/chats?$top={CHAT_TOP}&$select=id,topic,chatType"
-                       "&$orderby=lastMessagePreview/createdDateTime%20desc")
-    _chat_list = [(c["id"], c.get("topic") or c.get("chatType") or "chat") for c in res.get("value", [])]
-    _chat_list_at = time.time()
+    allc = _all_chats()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=CHAT_ACTIVE_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    active = [(i, t) for i, t, last in allc if last >= cutoff][:CHAT_MAX]
+    try:
+        catchup_new_chats(allc)
+    except Exception as e:
+        log(f"catch-up error: {e}")
+    _chat_list, _chat_list_at = active, time.time()
+    log(f"chats: {len(allc)} total, {len(active)} active within {CHAT_ACTIVE_DAYS}d -> subscribed set")
     return _chat_list
 
 
+def catchup_new_chats(allc):
+    """Record messages that arrived in chats we had no subscription for."""
+    try:
+        state = json.loads(CATCHUP_FILE.read_text())
+    except Exception:
+        state = {}
+    since = state.get("since") or (datetime.now(timezone.utc) - timedelta(seconds=CHAT_REFRESH_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    subs = _subs_load()
+    n_chats = n_msgs = 0
+    for chat_id, topic, last in allc:
+        if not last or last <= since or ("chat:" + chat_id) in subs:
+            continue
+        try:
+            msgs = graph("GET", f"chats/{chat_id}/messages?$top=50").get("value", [])
+        except Exception as e:
+            log(f"catch-up: {topic!r} failed: {str(e)[:80]}"); continue
+        n_chats += 1
+        for m in reversed(msgs):
+            if (m.get("createdDateTime") or "") <= since or m.get("messageType") != "message":
+                continue
+            frm = ((m.get("from") or {}).get("user") or {})
+            if _is_me(frm.get("displayName", "")):
+                continue
+            info = _chat_topic(chat_id)
+            record({"channel": "teams", "id": m.get("id"), "ts": m.get("createdDateTime"),
+                    "from": frm.get("displayName", ""), "from_name": frm.get("displayName", ""),
+                    "chat": info["topic"], "chat_type": info["type"], "chat_id": chat_id,
+                    "text": _strip_html((m.get("body") or {}).get("content", ""))[:400],
+                    "mentions": [x.get("mentionText", "") for x in m.get("mentions", [])],
+                    "catchup": True})
+            n_msgs += 1
+    CATCHUP_FILE.write_text(json.dumps({"since": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
+    if n_chats:
+        log(f"catch-up: {n_msgs} message(s) from {n_chats} unsubscribed chat(s)")
+
+
+def renew_one(sub_id):
+    subs = _subs_load()
+    for key, v in subs.items():
+        if v.get("id") == sub_id:
+            minutes = MAIL_SUB_MIN if key.startswith("mail:") else CHAT_SUB_MIN
+            try:
+                graph("PATCH", f"subscriptions/{sub_id}", {"expirationDateTime": _expiry(minutes)})
+                v["expiration"] = _expiry(minutes); _subs_save(subs)
+                return True
+            except Exception as e:
+                log(f"renew_one {key}: {str(e)[:100]}")
+                if "429" in str(e):
+                    _throttled_until[0] = time.time() + 120
+                return False
+    return False
+
+
 def ensure_subscriptions():
+    if time.time() < _throttled_until[0]:
+        return log("subscriptions: throttled, pass skipped")
+    if not _pass_lock.acquire(blocking=False):
+        return log("subscriptions: pass already running, skipped")
+    try:
+        _ensure_subscriptions_inner()
+    finally:
+        _pass_lock.release()
+
+
+def _ensure_subscriptions_inner():
     url = public_url()
     if not url:
         log("subscriptions: waiting for public_url.txt")
@@ -323,9 +428,21 @@ def ensure_subscriptions():
                          "resource": f"chats/{chat_id}/messages", "topic": topic}
             _subs_save(subs)
             made += 1
+            time.sleep(0.3)
         except Exception as e:
             _state["errors"] += 1
             log(f"subscriptions: chat {topic!r} error: {str(e)[:120]}")
+            if "429" in str(e):
+                _throttled_until[0] = time.time() + 120
+                log("subscriptions: throttled by Graph, pausing 2 minutes")
+                break
+            if "403" in str(e) and "Create" in str(e):
+                # Per-user cap on chat subscriptions reached (~100). Older ones that
+                # fell out of the active set are no longer renewed and expire within
+                # the hour, freeing slots; do not hammer Graph meanwhile.
+                waiting = [c for c, _ in targets if ("chat:" + c) not in subs]
+                log(f"subscriptions: cap reached; {len(waiting)} active chat(s) wait for expiring slots")
+                break
     # Forget chat subscriptions that have expired and fell out of the top list.
     for key in [k for k, v in subs.items() if k.startswith("chat:")]:
         try:
@@ -382,7 +499,7 @@ def sweep_unanswered_requests():
             # Only messages in this conversation sent AFTER the request, and follow
             # paging: a long-running ticket thread has 70+ messages and an unordered
             # $top=50 returned the oldest ones, hiding a reply sent 8 minutes after
-            # the request (a 70-message client thread, 2026-09-06).
+            # the request (Mahesh / TRM2026TN099, 2026-09-06).
             try:
                 flt = urllib.parse.quote(f"conversationId eq '{conv}' and sentDateTime ge {m['receivedDateTime']}")
                 url_t = f"me/messages?$filter={flt}&$select=from,sentDateTime,receivedDateTime&$top=50"
@@ -411,19 +528,43 @@ def sweep_unanswered_requests():
     log(f"sweep: unanswered client requests flagged: {found}")
 
 
+def catchup_tick():
+    """Every CATCHUP_S: the 50 most recently active chats (one call). Any of them
+    with a message newer than the last tick and no live subscription gets its
+    new messages fetched and recorded. This is what makes coverage independent
+    of the subscription cap: a message in ANY chat is seen within CATCHUP_S."""
+    res = graph("GET", "me/chats?$top=50&$select=id,topic,chatType&$expand=lastMessagePreview"
+                       "&$orderby=lastMessagePreview/createdDateTime%20desc")
+    allc = []
+    for c in res.get("value", []):
+        last = ((c.get("lastMessagePreview") or {}).get("createdDateTime")) or ""
+        allc.append((c["id"], c.get("topic") or c.get("chatType") or "chat", last))
+    catchup_new_chats(allc)
+
+
 def renewal_loop():
+    last = 0.0
+    last_catchup = 0.0
     while True:
-        try:
-            ensure_subscriptions()
-        except Exception as e:
-            log(f"renewal loop error: {e}")
-        if _sweep_count[0] % 6 == 0:                 # every 30 minutes
+        if time.time() - last_catchup >= CATCHUP_S:
+            last_catchup = time.time()
             try:
-                sweep_unanswered_requests()
+                catchup_tick()
             except Exception as e:
-                log(f"sweep error: {e}")
-        _sweep_count[0] += 1
-        time.sleep(300)
+                log(f"catch-up tick error: {str(e)[:120]}")
+        if _pass_requested[0] or time.time() - last >= 300:
+            _pass_requested[0] = False; last = time.time()
+            try:
+                ensure_subscriptions()
+            except Exception as e:
+                log(f"renewal loop error: {e}")
+            if _sweep_count[0] % 6 == 0:             # every 30 minutes
+                try:
+                    sweep_unanswered_requests()
+                except Exception as e:
+                    log(f"sweep error: {e}")
+            _sweep_count[0] += 1
+        time.sleep(60)
 
 
 # ---- Normalisation ---------------------------------------------------------
@@ -491,7 +632,7 @@ def normalise_whatsapp(evt):
     author = d.get("author") or ""
     from_me = bool(d.get("fromMe")) or author == "me"
     other = (jid.startswith(ESCALATE_TO) or (not from_me and not d.get("isGroup")
-             and author.strip().lower() in [n for n in os.environ.get("INBOX_ME_WA_NAMES", "").lower().split(",") if n]))
+             and author.strip().lower() in ("ahmad riaz", "ahmad", "ahmad riaz (other)")))
     return {"channel": "whatsapp", "id": d.get("messageId"), "from_other_phone": other,
             "ts": d.get("timestamp") or datetime.now(timezone.utc).isoformat(),
             "from": author if not from_me else "me", "from_me": from_me,
@@ -525,12 +666,12 @@ def is_important(item):
             return False, "own"
         if item.get("chat_type") == "oneOnOne":
             return True, "direct message"
-        if any(_is_me(m) for m in item.get("mentions", [])) or any("@" + n in text for n in ME_NAMES):
+        if any(_is_me(m) for m in item.get("mentions", [])) or "@ahmad" in text:
             return True, "you were mentioned"
         return False, "group chatter"
     if ch == "whatsapp":
         if item.get("from_other_phone") and not item.get("from_me"):
-            item["from"] = "you (other phone)"
+            item["from"] = "Ahmad (other phone)"
             try:
                 ACK_FILE.touch()
             except OSError:
@@ -540,7 +681,7 @@ def is_important(item):
             return False, "own"
         if not item.get("group"):
             return True, "direct message"
-        if any(m and m in text for m in item.get("mentions", [])) or any(n in text for n in ME_NAMES):
+        if any(m and m in text for m in item.get("mentions", [])) or "ahmad" in text:
             return True, "you were mentioned"
         return False, "group chatter"
     return False, "unknown"
@@ -548,12 +689,7 @@ def is_important(item):
 
 # ---- Persistence + delivery -------------------------------------------------
 def _claude_running():
-    """True if the Claude desktop app is running (macOS, Linux, Windows)."""
-    if sys.platform.startswith("win"):
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Claude.exe"], capture_output=True, text=True).stdout
-        return "Claude.exe" in out
-    name = "Claude" if sys.platform == "darwin" else "claude"
-    return subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0
+    return subprocess.run(["pgrep", "-x", "Claude"], capture_output=True).returncode == 0
 
 
 def _wa_send(phone, message):
@@ -630,7 +766,7 @@ def _summary_line(item, why):
 
 def _whisper(path, mime, language=None):
     """Transcribe. Whisper labels his Urdu as Hindi (Devanagari) or Punjabi
-    (Gurmukhi); the user speaks English, Urdu and Punjabi and wants Urdu script,
+    (Gurmukhi); he speaks English, Urdu and Punjabi and wants Urdu script,
     never Hindi. So detect first, and re-run forced to Urdu on hi/pa."""
     data = path.read_bytes()
     b = "----inboxwhisper"
@@ -708,7 +844,7 @@ def record(item):
         _state["last_event"] = item["received"]
         if important:
             # Mentions and direct messages on Teams/WhatsApp: the agent replies as
-            # the user and asks what is needed first (the user's rule, 2026-09-06). Mail
+            # the user and asks what is needed first (his rule, 2026-09-06). Mail
             # alerts and the unanswered-request sweep still escalate automatically.
             conversational = item["channel"] in ("teams", "whatsapp") and why in (
                 "direct message", "you were mentioned", "your instruction via WhatsApp")
@@ -807,13 +943,17 @@ class H(BaseHTTPRequestHandler):
             if n.get("clientState") != secret():
                 log("graph: clientState mismatch, dropped"); continue
             if n.get("lifecycleEvent"):
-                log(f"graph: lifecycle {n['lifecycleEvent']} for {n.get('subscriptionId')}; running subscription pass")
-                if n["lifecycleEvent"] == "subscriptionRemoved":
-                    subs = _subs_load()
-                    for k in [k for k, v in subs.items() if v.get("id") == n.get("subscriptionId")]:
-                        del subs[k]
-                    _subs_save(subs)
-                threading.Thread(target=ensure_subscriptions, daemon=True).start()
+                ev = n["lifecycleEvent"]
+                if ev == "reauthorizationRequired":
+                    renew_one(n.get("subscriptionId"))
+                else:
+                    log(f"graph: lifecycle {ev} for {n.get('subscriptionId')}; pass requested")
+                    if ev == "subscriptionRemoved":
+                        subs = _subs_load()
+                        for k in [k for k, v in subs.items() if v.get("id") == n.get("subscriptionId")]:
+                            del subs[k]
+                        _subs_save(subs)
+                    _pass_requested[0] = True
                 continue
             res = n.get("resource", "")
             try:

@@ -64,6 +64,10 @@ STATUS_PATH = HOME / ".voicemode" / "indicator" / "bargein.status"
 # It was referenced without ever being defined - the NameError was eaten by a
 # bare except, so the pause silently survived every wake for two days.
 PAUSE_FLAG = HOME / ".voicemode" / "indicator" / "paused.flag"
+# Raised while the daemon records the user itself (interrupt on a turn that
+# does not listen). The menu bar shows it as Listening, so an interrupt
+# looks the same to him whichever side holds the mic.
+CAPTURE_FLAG = HOME / ".voicemode" / "indicator" / "daemon_capture.flag"
 # Touched whenever this daemon verifies HIS voice (barge-in fire, wake, capture).
 # inbox_hooks reads its mtime as "he responded" before escalating to WhatsApp.
 ACK_FILE = HOME / ".voicemode" / "context" / "ack"
@@ -92,7 +96,7 @@ VAD_RATE = 16000
 # longest consecutive run was exactly 6, i.e. right on the trigger boundary.
 # Use N-of-M instead: tolerant of inter-syllable gaps, still needs sustained
 # activity rather than a single spike.
-SUSTAIN_HITS = int(os.environ.get("BARGEIN_SUSTAIN_HITS", 5))    # qualifying frames
+SUSTAIN_HITS = int(os.environ.get("BARGEIN_SUSTAIN_HITS", 4))    # qualifying frames
 SUSTAIN_WINDOW = int(os.environ.get("BARGEIN_SUSTAIN_WINDOW", 18))  # out of the last ~540ms     # ~150ms
 ARM_SUPPRESS_S = float(os.environ.get("BARGEIN_ARM_SUPPRESS", 0.35))
 COOLDOWN_S = float(os.environ.get("BARGEIN_COOLDOWN", 2.0))
@@ -117,6 +121,15 @@ VAD_LEVEL = int(os.environ.get("BARGEIN_VAD_LEVEL", 1))
 # fired on our own playback. A voiceprint can: measured on this setup,
 # the user scores +0.88 on a 1.5s window and Kokoro TTS scores +0.53.
 VOICEPRINT_PATH = HOME / ".voicemode" / "indicator" / "voiceprint.npy"
+# Preferred: an ECAPA-TDNN print (speechbrain/spkrec-ecapa-voxceleb, ~0.8% EER)
+# built by enrol_embed.py. resemblyzer (GE2E, ~7% EER) stays as the fallback.
+ECAPA_PRINT_PATH = HOME / ".voicemode" / "indicator" / "voiceprint_ecapa.npy"
+ECAPA_DIR = HOME / ".voicemode" / "indicator" / "ecapa"
+# Measured 2026-09-06 on 1.7 s windows: genuine median 0.75 / p10 0.58; own TTS
+# max 0.08; room voices max 0.08. Bar halfway between the two clusters.
+SPEAKER_THRESHOLD_ECAPA = float(os.environ.get("BARGEIN_SPEAKER_THRESHOLD_ECAPA", 0.33))
+WAKE_THRESHOLD_ECAPA = float(os.environ.get("BARGEIN_WAKE_SPK_ECAPA", 0.30))    # ~1 s clips score lower
+_ecapa = [None]
 # Measured: on CLEAN audio the user scores ~0.99, but MIXED with our own TTS
 # playing, the same voice scores 0.58-0.69 - the mixture drags the embedding
 # toward the interfering speaker. A 0.65 threshold sat inside that band, so
@@ -124,7 +137,7 @@ VOICEPRINT_PATH = HOME / ".voicemode" / "indicator" / "voiceprint.npy"
 # Kokoro alone scores 0.46-0.56, so 0.57 clears it while accepting the user.
 # This is safe to lower because the energy gate is a second, independent
 # filter - both must pass.
-SPEAKER_THRESHOLD = float(os.environ.get("BARGEIN_SPEAKER_THRESHOLD", 0.60))
+SPEAKER_THRESHOLD = float(os.environ.get("BARGEIN_SPEAKER_THRESHOLD", 0.55))
 # Longer window = higher similarity, because the embedding sees more of the
 # speaker and less of everything else. Measured on clean audio: 1.0s -> 0.74,
 # 1.5s -> 0.88. Mixed with TTS the scores cluster at 0.56-0.61 against a 0.57
@@ -187,6 +200,11 @@ CMD_MAX_SPEECH_S = float(os.environ.get("BARGEIN_CMD_MAX_S", 30.0))
 # beats the hangover (00:08:28 / 00:08:32). For this long after a wake-only
 # match, a phrase-less follow-up from the enrolled speaker IS the command.
 CMD_WINDOW_S = float(os.environ.get("BARGEIN_CMD_WINDOW", 4.0))
+# After VoiceMode closes its listen window (he paused longer than its silence
+# threshold), anything he says in the next CONTINUE_S seconds is a continuation:
+# capture it and inject it without requiring the wake phrase. He lost half a
+# sentence this way at 05:09 ("you just stopped listening").
+CONTINUE_S = float(os.environ.get("BARGEIN_CONTINUE_S", 2.5))
 # Manual/debug hook: write text here and the daemon pastes it as if spoken.
 INJECT_FILE = HOME / ".voicemode" / "indicator" / "inject.txt"
 # An injected message is only seen by the agent at its next tool boundary. If
@@ -196,6 +214,21 @@ INJECT_FILE = HOME / ".voicemode" / "indicator" / "inject.txt"
 # message, and answers it instead of finishing a now-stale sentence.
 CUT_TTS_WINDOW_S = float(os.environ.get("BARGEIN_CUT_TTS_WINDOW", 30.0))
 _cut_tts_until = [0.0]
+# When the injection happened, and when the agent last STARTED a tool call.
+# An injection reaches the agent at its next tool boundary, so a converse
+# started AFTER the injection is already the reply: never cut that one. Only
+# a converse that was already in flight when the message landed gets cut.
+# Without this the daemon cut the agent's answer to every wake-word message
+# after ~1.5 s, all night, and it looked like barge-in misfiring.
+_inject_at = [0.0]
+_last_tool_start = [0.0]
+# Does the converse call now running end in a listen? Read off the
+# TOOL_REQUEST_START event (data.wait_for_response). True: an interrupt is
+# handed to VoiceMode, which opens the mic ~1.2 s after playback stops, and
+# the daemon must NOT record, or the two race and his words go in as text
+# while VoiceMode listens to silence. False: VoiceMode will never listen,
+# so record him at once. None: unknown (e.g. a turns survey), timed fallback.
+_vm_will_listen = [None]
 # True while our TTS is playing (event log). An injection that lands DURING
 # speech or DURING a listen window must interrupt that step right away, not
 # just the next one - he waited a full sentence plus a listen for a message
@@ -222,9 +255,9 @@ STREAM_STOP_TIMEOUT_S = float(os.environ.get("BARGEIN_STOP_TIMEOUT", 3.0))
 # Rolling background estimate of our own playback as heard by this mic.
 BG_WINDOW = int(os.environ.get("BARGEIN_BG_WINDOW", 50))        # ~1.5s of frames
 BG_MIN_SAMPLES = int(os.environ.get("BARGEIN_BG_MIN", 20))      # ~600ms before arming
-BG_MULT = float(os.environ.get("BARGEIN_BG_MULT", 3.0))
+BG_MULT = float(os.environ.get("BARGEIN_BG_MULT", 2.2))
 # Minimum multiple of the ambient floor before anything counts as speech.
-MIN_MARGIN = float(os.environ.get("BARGEIN_MIN_MARGIN", 2.5))
+MIN_MARGIN = float(os.environ.get("BARGEIN_MIN_MARGIN", 1.8))
 
 
 def log(msg):
@@ -249,9 +282,9 @@ def write_status(state, extra=""):
 
 
 def find_mic():
-    """Prefer the headset named in BARGEIN_MIC_NAME; index order is not stable."""
+    """Prefer the mic named by BARGEIN_MIC_NAME; index order is not stable."""
     for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0 and os.environ.get("BARGEIN_MIC_NAME", "COUGAR") in d["name"]:
+        if d["max_input_channels"] > 0 and os.environ.get("BARGEIN_MIC_NAME", "USB") in d["name"]:
             return i, d["name"]
     d = sd.query_devices(kind="input")
     return None, d["name"]
@@ -328,9 +361,26 @@ _voiceprint = None
 
 
 def load_speaker_model():
-    """Load the voiceprint and encoder. Absent voiceprint = fall back to the
-    old energy/VAD behaviour rather than refusing to run."""
-    global _encoder, _voiceprint
+    """Load the voiceprint and encoder: ECAPA if enrolled, else resemblyzer.
+    Absent voiceprint = fall back to energy/VAD rather than refusing to run."""
+    global _encoder, _voiceprint, SPEAKER_THRESHOLD, WAKE_SPEAKER_THRESHOLD
+    if ECAPA_PRINT_PATH.exists():
+        try:
+            import torch
+            from speechbrain.inference.speaker import EncoderClassifier
+            enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
+                                                 savedir=str(ECAPA_DIR), run_opts={"device": "cpu"})
+            with torch.no_grad():
+                enc.encode_batch(torch.zeros(1, 16000))          # warm up
+            _ecapa[0] = enc
+            _voiceprint = np.load(str(ECAPA_PRINT_PATH))
+            _encoder = "ecapa"
+            SPEAKER_THRESHOLD = SPEAKER_THRESHOLD_ECAPA
+            WAKE_SPEAKER_THRESHOLD = WAKE_THRESHOLD_ECAPA
+            log(f"ECAPA voiceprint loaded (dim={_voiceprint.shape[0]}), threshold={SPEAKER_THRESHOLD}")
+            return True
+        except Exception as e:
+            log(f"ECAPA unavailable ({e}); falling back to resemblyzer")
     if not VOICEPRINT_PATH.exists():
         log("no voiceprint enrolled - falling back to energy+VAD only")
         return False
@@ -378,6 +428,72 @@ def _loudest_span(frames_bytes, keep=0.75):
     return frames_bytes[best_i:best_i + n]
 
 
+_tts_print = [None]          # running embedding of OUR playback as the mic hears it
+REL_MARGIN = float(os.environ.get("BARGEIN_REL_MARGIN", 0.04))
+REL_MIN = float(os.environ.get("BARGEIN_REL_MIN", 0.50))
+# Second, looser tier: accept sooner when his score is still climbing but
+# already clearly above the TTS. Measured 2026-09-06 05:34 with other audio
+# in the room: his first checks scored 0.24/0.23/0.29/0.31 vs TTS 0.02-0.10
+# and were rejected for 4 s before a 0.65 got through. Other voices over
+# TTS score 0.0-0.1, so 0.22 with a 0.15 margin over the TTS stays clear.
+REL2_MIN = float(os.environ.get("BARGEIN_REL2_MIN", 0.22))
+REL2_MARGIN = float(os.environ.get("BARGEIN_REL2_MARGIN", 0.15))
+
+
+def _embed(frames_bytes):
+    """Speaker embedding of a clip (loudest span), or None if too short."""
+    if _encoder is None:
+        return None
+    frames_bytes = _loudest_span(frames_bytes)
+    pcm = np.frombuffer(b"".join(frames_bytes), dtype=np.int16)
+    if len(pcm) < RATE // 2:
+        return None
+    x = pcm.astype(np.float32) / 32768.0
+    x16 = signal.resample(x, int(len(x) * 16000 / RATE)).astype(np.float32)
+    if _encoder == "ecapa":
+        import torch
+        with torch.no_grad():
+            e = _ecapa[0].encode_batch(torch.tensor(x16)[None]).squeeze().numpy()
+        return e / (np.linalg.norm(e) + 1e-9)
+    return _encoder.embed_utterance(x16)
+
+
+def learn_tts_print(frames_bytes):
+    """Update the running print of our own TTS from a window with no user speech."""
+    try:
+        e = _embed(frames_bytes)
+        if e is None:
+            return
+        if _tts_print[0] is None:
+            _tts_print[0] = e
+        else:
+            m = 0.8 * _tts_print[0] + 0.2 * e
+            _tts_print[0] = m / (np.linalg.norm(m) + 1e-9)
+    except Exception as ex:
+        log(f"tts print update failed ({ex})")
+
+
+def is_user_over_tts(frames_bytes):
+    """Relative decision for interruptions: the window holds the user AND our
+    playback, so compare against both prints. Accept if it is clearly more
+    like the user than like the TTS, or if it clears the absolute bar."""
+    if _encoder is None or _voiceprint is None:
+        return True, -1.0, -1.0
+    try:
+        e = _embed(frames_bytes)
+        if e is None:
+            return False, 0.0, 0.0
+        su = float(np.dot(_voiceprint, e))
+        st = float(np.dot(_tts_print[0], e)) if _tts_print[0] is not None else -1.0
+        ok = (su >= SPEAKER_THRESHOLD
+              or (st >= 0 and su >= REL_MIN and su - st >= REL_MARGIN)
+              or (st >= 0 and su >= REL2_MIN and su - st >= REL2_MARGIN))
+        return ok, su, st
+    except Exception as ex:
+        log(f"speaker check failed ({ex}) - allowing")
+        return True, -1.0, -1.0
+
+
 def is_user_speaking(frames_bytes):
     """Compare recent audio against the enrolled voiceprint.
 
@@ -387,15 +503,11 @@ def is_user_speaking(frames_bytes):
     if _encoder is None or _voiceprint is None:
         return True, -1.0
     try:
-        frames_bytes = _loudest_span(frames_bytes)
-        pcm = np.frombuffer(b"".join(frames_bytes), dtype=np.int16)
-        if len(pcm) < RATE // 2:
+        emb = _embed(frames_bytes)
+        if emb is None:
             return False, 0.0
-        # resemblyzer expects float32 @16k
-        x = pcm.astype(np.float32) / 32768.0
-        x16 = signal.resample(x, int(len(x) * 16000 / RATE)).astype(np.float32)
-        emb = _encoder.embed_utterance(x16)
-        return float(np.dot(_voiceprint, emb)) >= SPEAKER_THRESHOLD, float(np.dot(_voiceprint, emb))
+        sc = float(np.dot(_voiceprint, emb))
+        return sc >= SPEAKER_THRESHOLD, sc
     except Exception as e:
         log(f"speaker check failed ({e}) - allowing")
         return True, -1.0
@@ -713,7 +825,7 @@ def _ax_press(el):
 
 def switch_session(title):
     """Bring a session to the front by clicking its sidebar entry. `title` may
-    be a ">"-separated path, e.g. "Chat and Cowork>My chat" (click the tab, then
+    be a ">"-separated path, e.g. "Chats>My chat" (click the Chats tab, then
     the chat), because chat sessions are not rendered while the Code tab is
     showing. Composer cache is dropped: it belongs to the old view."""
     steps = [t.strip() for t in title.split(">") if t.strip()]
@@ -880,6 +992,7 @@ def launch_session(text=WAKE_PROMPT):
 
     ok, why = _native_paste(text)
     if ok and text != WAKE_PROMPT:
+        _inject_at[0] = time.time()
         if _tts_playing[0] or VM_RECORDING_FLAG.exists():
             log("inject: agent is mid-step (speaking/listening) - skipping forward now")
             threading.Thread(target=fire, daemon=True).start()
@@ -944,6 +1057,20 @@ def launch_session(text=WAKE_PROMPT):
 
 
 def _capture_and_inject(device, preroll, floor):
+    try:
+        CAPTURE_FLAG.touch()
+    except Exception:
+        pass
+    try:
+        return _capture_and_inject_inner(device, preroll, floor)
+    finally:
+        try:
+            CAPTURE_FLAG.unlink()
+        except Exception:
+            pass
+
+
+def _capture_and_inject_inner(device, preroll, floor):
     """Record one utterance (energy-gated, 1.0s hangover, 20s cap), verify
     the speaker, transcribe, and paste it as a [voice] line. Called after a
     barge-in when VoiceMode did NOT open the mic - i.e. the agent was talking
@@ -987,9 +1114,18 @@ def _start_verify_server():
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n)
-                frames = [raw[i:i + FRAME * 2] for i in range(0, len(raw) - FRAME * 2, FRAME * 2)]
-                _, score = is_user_speaking(frames)
-                body = f"{score:.4f}".encode()
+                # Two callers share this endpoint: the end-of-turn gate sends a
+                # ~1.5 s tail (keep scoring it), the listen-window FILTER sends the
+                # whole take. On a take with other voices in the room the filter
+                # rejected his real answer and re-recorded the room for 94 s
+                # (2026-09-06 04:50). Until a better speaker model exists, answer
+                # "cannot tell" (-1) for whole takes so the filter falls through.
+                if len(raw) >= RATE * 2 * 4 and not (HOME / ".voicemode" / "indicator" / "speaker_filter.on").exists():
+                    body = b"-1 filter-disabled"
+                else:
+                    frames = [raw[i:i + FRAME * 2] for i in range(0, len(raw) - FRAME * 2, FRAME * 2)]
+                    _, score = is_user_speaking(frames)
+                    body = f"{score:.4f}".encode()
             except Exception as e:
                 body = f"-1 {e}".encode()[:120]
             self.send_response(200)
@@ -1040,6 +1176,22 @@ def fire():
     if not CONTROL_SOCK.exists():
         log("TRIGGER suppressed: control socket absent (not speaking?)")
         return False
+    # Talk to the socket directly: newline-delimited JSON, see VoiceMode's
+    # control_channel.parse_command. Spawning the CLI took ~3 s per stop
+    # (Python start-up), which was most of the interrupt latency.
+    try:
+        import socket as _socket
+        _t = time.time()
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as _s:
+            _s.settimeout(1.0)
+            _s.connect(str(CONTROL_SOCK))
+            _s.sendall(b'{"command": "skip_forward"}\n')
+            # No reply is sent for commands (only for status); waiting on
+            # recv cost a full 1 s timeout on the first live test.
+        log(f"TRIGGER fired -> socket in {(time.time()-_t)*1000:.0f} ms")
+        return True
+    except Exception as e:
+        log(f"TRIGGER socket failed ({e}); falling back to the CLI")
     try:
         r = subprocess.run([VOICEMODE_BIN, "control", "skip-forward"],
                            capture_output=True, text=True, timeout=6)
@@ -1202,7 +1354,7 @@ def main():
                             AX_DUMP_PATH.write_text(f"nodes={_n}\n" + "\n".join(_out) + "\n")
                             log(f"axtitles: {len(_out)} labelled elements of {_n}")
                             if _path:
-                                switch_session(os.environ.get("BARGEIN_HOME_SESSION", "Code"))
+                                switch_session(os.environ.get("BARGEIN_HOME_SESSION", "Code>My voice session"))
                         except Exception as e:
                             log(f"axtitles: failed ({e})")
                     elif _txt == "@@axdump":
@@ -1216,23 +1368,39 @@ def main():
                         log(f"inject: pasted from file ({len(_txt)} chars)")
                 except Exception as e:
                     log(f"inject: failed ({e})")
-            if capture_after_fire and time.time() - capture_after_fire["t"] >= 1.5:
+            # Fallback only when the listen flag was unknown: VoiceMode needs
+            # ~1.2 s after playback stops to open the mic, and the cut itself
+            # takes a moment, so 1.5 s from the fire was too early and this
+            # path stole interrupts that VoiceMode was about to take.
+            if capture_after_fire and time.time() - capture_after_fire["t"] >= 3.0:
                 caf, capture_after_fire = capture_after_fire, None
                 if vm_recording or VM_RECORDING_FLAG.exists():
                     log("capture: VoiceMode is listening, leaving it to the mic")
                 else:
                     log("capture: agent was not listening after the interrupt - recording you")
                     close_stream()
-                    _capture_and_inject(device, caf["pre"], max(caf["floor"] or floor, floor))
+                    _capture_and_inject(device, list(ring), max(caf["floor"] or floor, floor))
             for ev in tail.events():
                 et = ev.get("event_type")
                 if et in ("RECORDING_END", "STT_START", "TOOL_REQUEST_END"):
                     if vm_recording:
                         vm_recording = False
                         log("wake listening resumed (VoiceMode released mic)")
+                        if et == "RECORDING_END":
+                            cmd_window_until = time.time() + CONTINUE_S
+                            wake_hold_until = 0.0        # listen right away
 
+                if et == "TOOL_REQUEST_START":
+                    _last_tool_start[0] = time.time()
+                    _w = (ev.get("data") or {}).get("wait_for_response")
+                    _vm_will_listen[0] = _w if isinstance(_w, bool) else None
+                if et == "TOOL_REQUEST_END":
+                    _vm_will_listen[0] = None
                 if et == "TTS_PLAYBACK_START":
                     _tts_playing[0] = True
+                    if time.time() < _cut_tts_until[0] and _last_tool_start[0] > _inject_at[0]:
+                        _cut_tts_until[0] = 0.0
+                        log("TTS after an injection, but this tool call started after it: it is the reply, not cutting")
                     if time.time() < _cut_tts_until[0]:
                         _cut_tts_until[0] = 0.0
                         log("TTS started with an injected message pending - cutting it "
@@ -1294,6 +1462,10 @@ def main():
                     write_status("error", str(e)[:80])
                     continue
 
+                # First 1.5 s of playback with no candidate hits = pure TTS as this
+                # mic hears it: feed the TTS print (used by the relative test).
+                if 1.5 <= time.time() - armed_at < 1.5 + FRAME_MS / 1000.0 and diag["max_consec"] == 0:
+                    learn_tts_print(list(ring)[-int(1.5 * 1000 / FRAME_MS):])
                 # Buffer every frame, including suppressed ones: the user may
                 # start speaking inside the suppression window and we still want
                 # those samples in the preroll.
@@ -1374,17 +1546,26 @@ def main():
                     # Final gate: is this actually the enrolled speaker? This is
                     # what stops our own TTS from triggering an interrupt.
                     verify_frames = list(ring)[-int(VERIFY_SECONDS * 1000 / FRAME_MS):]
-                    matched, score = is_user_speaking(verify_frames)
+                    matched, score, tts_sim = is_user_over_tts(verify_frames)
                     if not matched:
                         log(f"speech over TTS REJECTED - not your voice "
-                            f"(similarity {score:.2f} < {SPEAKER_THRESHOLD})")
+                            f"(you {score:.2f} vs tts {tts_sim:.2f}, bar {SPEAKER_THRESHOLD}/margin {REL_MARGIN})")
                         hits.clear()
                         continue
-                    log(f"YOUR VOICE detected over TTS (rms={rms:.0f} floor={live_floor:.0f} similarity={score:.2f}) - interrupting")
+                    log(f"YOUR VOICE detected over TTS (rms={rms:.0f} floor={live_floor:.0f} you={score:.2f} tts={tts_sim:.2f}) - interrupting")
                     write_preroll(list(ring))
                     fire()
                     _ack()
-                    capture_after_fire = {"t": time.time(), "pre": list(ring), "floor": live_floor}
+                    if _vm_will_listen[0] is True:
+                        log("interrupt: this turn listens - VoiceMode takes the mic, daemon will not record")
+                        capture_after_fire = None
+                    elif _vm_will_listen[0] is False:
+                        log("interrupt: this turn does not listen - recording you now")
+                        close_stream()
+                        _capture_and_inject(device, list(ring), live_floor or floor)
+                        capture_after_fire = None
+                    else:
+                        capture_after_fire = {"t": time.time(), "floor": live_floor}
                     # skip_forward makes VoiceMode fall straight into its
                     # listen turn. Hold wake mode off NOW rather than waiting
                     # for RECORDING_START to trickle through the log.
@@ -1450,9 +1631,10 @@ def main():
                     clip = full[:int(WAKE_DETECT_S * 1000 / FRAME_MS)]
                     wake_buf = []; wake_active = False; wake_quiet = 0
                     peak = max((float(np.sqrt(np.mean(np.frombuffer(f,dtype=np.int16).astype(np.float32)**2))) for f in clip), default=0.0)
-                    log(f"wake: burst {dur:.2f}s peak_rms={peak:.0f} (floor {wake_floor:.0f})")
                     if dur < WAKE_MIN_SPEECH_S:
+                        log(f"wake: short burst {dur:.2f}s peak_rms={peak:.0f} ignored (< {WAKE_MIN_SPEECH_S}s)")
                         continue
+                    log(f"wake: burst {dur:.2f}s peak_rms={peak:.0f} (floor {wake_floor:.0f})")
                     if (time.time() - last_wake < WAKE_COOLDOWN_S
                             and time.time() >= cmd_window_until):
                         continue

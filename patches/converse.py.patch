@@ -68,9 +68,9 @@
 +        except Exception:
 +            pass
 +        return None
- 
- 
 +
+ 
+ 
 +# --- speaker-gated end-of-turn -------------------------------------------
 +# Plain VAD keeps a recording open for ANY sound, so a noisy room never yields
 +# the quiet needed to end a turn. These ask the barge-in daemon (which holds a
@@ -83,7 +83,7 @@
 +# the enrolled voice, but the reply window recorded whoever spoke: a bystander
 +# or a TV could land as the user's answer. Score the whole take; below this
 +# similarity it is dropped and we listen again (at most _MAX times per turn).
-+# Measured 2026-09-06: the user's voice 0.99 clean / 0.58-0.69 over TTS, a video in
++# Measured 2026-09-06: his voice 0.99 clean / 0.58-0.69 over TTS, a video in
 +# the room 0.45-0.52, one other speaker in it 0.57-0.79 on 1-3s bursts.
 +_VM_SPEAKER_REJECT = os.environ.get("VOICEMODE_SPEAKER_REJECT", "1") not in ("0", "false", "False")
 +_VM_SPEAKER_REJECT_MIN = float(os.environ.get("VOICEMODE_SPEAKER_REJECT_MIN", 0.55))
@@ -137,7 +137,7 @@
          stop_recording = False
  
          # Use a queue for thread-safe communication
-@@ -1537,6 +1637,30 @@
+@@ -1537,6 +1637,37 @@
                          # Check if chunk contains speech
                          try:
                              is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
@@ -156,19 +156,26 @@
 +                            # recording rather than a constant, so it adapts to
 +                            # whatever the room is doing today.
 +                            _rms = float(np.sqrt(np.mean(chunk_flat.astype(np.float64) ** 2)))
-+                            _VM_NOISE_SAMPLES.append(_rms)
-+                            if len(_VM_NOISE_SAMPLES) > 400:
-+                                _VM_NOISE_SAMPLES.pop(0)
++                            # Sample ONLY frames VAD calls non-speech. Sampling every
++                            # frame let the user's own opening words set the floor at
++                            # twice their speech level, after which normal speech
++                            # counted as silence and turns ended mid-sentence
++                            # (2026-09-06 05:10, "I was speaking and you cut me off").
++                            # Rolling window, and a cap: a room never needs more.
++                            if not is_speech:
++                                _VM_NOISE_SAMPLES.append(_rms)
++                                if len(_VM_NOISE_SAMPLES) > 400:
++                                    _VM_NOISE_SAMPLES.pop(0)
 +                            if len(_VM_NOISE_SAMPLES) >= 20:
-+                                _VM_NOISE_FLOOR = max(
-+                                    float(np.percentile(_VM_NOISE_SAMPLES[:60], 75)) * 2.0,
-+                                    120.0)
++                                _VM_NOISE_FLOOR = min(max(
++                                    float(np.percentile(_VM_NOISE_SAMPLES[-100:], 75)) * 2.0,
++                                    120.0), 600.0)
 +                                if is_speech and _rms < _VM_NOISE_FLOOR:
 +                                    is_speech = False
                              if VAD_DEBUG:
                                  # Log VAD decision every 500ms for less spam
                                  if int(recording_duration * 1000) % 500 == 0:
-@@ -1555,8 +1679,23 @@
+@@ -1555,8 +1686,23 @@
                                      logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
                                  speech_detected = True
                                  silence_duration_ms = 0
@@ -194,7 +201,7 @@
                          else:
                              # We have detected speech at some point
                              if is_speech:
-@@ -1573,6 +1712,18 @@
+@@ -1573,6 +1719,18 @@
                                  # Check if we should stop due to silence threshold
                                  # Use the larger of MIN_RECORDING_DURATION (global) or min_duration (parameter)
                                  effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
@@ -213,7 +220,7 @@
                                  if recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
                                      logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
                                      if VAD_DEBUG:
-@@ -1594,6 +1745,11 @@
+@@ -1594,6 +1752,11 @@
              
              # Concatenate all chunks
              if chunks:
@@ -225,7 +232,7 @@
                  full_recording = np.concatenate(chunks)
                  
                  if not speech_detected:
-@@ -1611,6 +1767,10 @@
+@@ -1611,6 +1774,10 @@
                      logger.debug(f"Recording stats - RMS: {rms:.2f}, Speech detected: {speech_detected}")
                  
                  # Return tuple: (audio_data, speech_detected)
@@ -236,7 +243,7 @@
                  return (full_recording, speech_detected)
              else:
                  logger.warning("No audio chunks recorded")
-@@ -1975,13 +2135,28 @@
+@@ -1975,13 +2142,28 @@
      # executor future again after that, so its eventual (now fast) result is
      # simply discarded.
      stop_event = threading.Event()

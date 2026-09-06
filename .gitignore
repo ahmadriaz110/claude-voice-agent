@@ -8,3 +8,9 @@ media/
 *.bak
 __pycache__/
 .venv/
+voiceprint_ecapa.npy
+voiceprint_v2.npy
+ecapa/
+enrolment*.wav
+tts_sample.wav
+daemon_capture.flag

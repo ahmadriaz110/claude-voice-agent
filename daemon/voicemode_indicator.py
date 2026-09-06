@@ -75,6 +75,7 @@ VOICE_PROMPT = "Start voice mode and talk to me."
 # light and light on dark - visible either way. The active states stay as
 # emoji because their colour is the whole point and reads on both themes.
 IDLE_GLYPH = "○"
+CAPTURE_FLAG = Path.home() / ".voicemode" / "indicator" / "daemon_capture.flag"
 
 # Animation frames per state. Idle stays STATIC - a permanently moving menu bar
 # item is a distraction when nothing is happening. The active states animate so
@@ -382,10 +383,16 @@ class VoiceModeIndicator(rumps.App):
         self.terminal_menu.add(self.model_menu)
         self.terminal_menu.add(self.effort_menu)
 
+        # Open items from the task ledger (tasks.py), refreshed in tick(). He asked
+        # to see what the agent is working on without asking; the app's own
+        # right-hand pane only lists running background jobs.
+        self.tasks_menu = rumps.MenuItem("Tasks")
+        self._tasks_stamp = 0.0
         self.menu = [
             self.state_item,
             self.last_item,
             self.health_item,
+            self.tasks_menu,
             None,
             self.barge_item,
             self.pause_item,
@@ -404,6 +411,7 @@ class VoiceModeIndicator(rumps.App):
 
         self._anim_i = 0
         self._anim_state = None
+        self._cap_seen = False
         self._anim_last = 0.0
         self._fh = None
         self._path = None
@@ -423,6 +431,7 @@ class VoiceModeIndicator(rumps.App):
         self._sync_pause_items()
         self._rebuild_sessions()
         rumps.Timer(self.tick, POLL_SECONDS).start()
+        self._refresh_tasks()
 
     def _apply_prefs_to_settings(self) -> bool:
         """Write the thinking toggle to settings.json.
@@ -677,7 +686,43 @@ class VoiceModeIndicator(rumps.App):
             except OSError:
                 self._fh = None
 
+    def _refresh_tasks(self):
+        """Rebuild the Tasks submenu from ~/.voicemode/context/tasks.json when it changes."""
+        import json as _json
+        from pathlib import Path as _P
+        db = _P.home() / ".voicemode" / "context" / "tasks.json"
+        try:
+            st = db.stat().st_mtime
+        except OSError:
+            return
+        if st == self._tasks_stamp:
+            return
+        self._tasks_stamp = st
+        try:
+            tasks = _json.loads(db.read_text()).get("tasks", [])
+        except Exception:
+            return
+        open_ = [t for t in tasks if t.get("status") != "done"]
+        if getattr(self.tasks_menu, "_menu", None) is not None:   # no submenu yet on first run
+            self.tasks_menu.clear()
+        self.tasks_menu.title = f"Tasks ({len(open_)} open)"
+        order = {"in-progress": 0, "blocked": 1, "open": 2}
+        for t in sorted(open_, key=lambda t: (order.get(t.get("status"), 3), t.get("id", 0))):
+            mark = {"in-progress": "▶", "blocked": "⛔", "open": "○"}.get(t.get("status"), "•")
+            self.tasks_menu.add(rumps.MenuItem(f"{mark} #{t.get('id')} {t.get('text', '')[:70]}"))
+        if not open_:
+            self.tasks_menu.add(rumps.MenuItem("Nothing open"))
+        done = [t for t in tasks if t.get("status") == "done"][-5:]
+        if done:
+            self.tasks_menu.add(None)
+            for t in reversed(done):
+                self.tasks_menu.add(rumps.MenuItem(f"✓ #{t.get('id')} {t.get('text', '')[:60]}"))
+
     def tick(self, _):
+        try:
+            self._refresh_tasks()
+        except Exception:
+            pass
         if self._path != self._today_path() or self._fh is None:
             self._open_today()
 
@@ -705,6 +750,22 @@ class VoiceModeIndicator(rumps.App):
                     self.title = glyph
                 self.state_item.title = label
                 self.last_item.title = f"Last activity: {self._fmt(self._last_event_at)}"
+
+        # The barge-in daemon records the user itself when the agent spoke a
+        # turn without listening. Show that as Listening too.
+        cap = CAPTURE_FLAG.exists()
+        if cap != self._cap_seen:
+            self._cap_seen = cap
+            if cap:
+                self._anim_state = "Listening" if "Listening" in ANIM_FRAMES else None
+                self._anim_i = 0
+                if self._anim_state is None:
+                    self.title = "\U0001F534"
+                self.state_item.title = "Listening (daemon)"
+            else:
+                self._anim_state = None
+                self.title = IDLE_GLYPH
+                self.state_item.title = "Idle"
 
         now = datetime.now().timestamp()
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task ledger for tasks the user assigns by voice or chat.
+"""Task ledger for tasks Ahmad assigns by voice or chat.
 
   tasks.py add "text" [--note "..."]      -> new open task, prints id
   tasks.py start ID | done ID | block ID [--note "..."]

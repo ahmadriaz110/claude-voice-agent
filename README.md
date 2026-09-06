@@ -37,13 +37,14 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
 
 | Path | What it is |
 |---|---|
-| `daemon/bargein_daemon.py` | Wake word, barge-in, post-interrupt capture, speaker-verify server, native AX paste into the Claude composer, `@@session=` named-session commands, `@@axtitles` label dump |
+| `daemon/bargein_daemon.py` | Wake word, barge-in, post-interrupt capture, ECAPA speaker verification (with a resemblyzer fallback) and the verify server voice-mode calls, native AX paste into the Claude composer, `@@session=` named-session commands, `@@axtitles` label dump |
 | `daemon/launcher.c` | Tiny fork-not-exec launcher so the daemon keeps its own macOS TCC (Accessibility / Microphone) identity |
 | `daemon/voicemode_indicator.py` | rumps menu-bar indicator (listening / thinking / speaking) |
 | `inbox/inbox_hooks.py` | Push receiver: Graph subscriptions, WhatsApp webhook, digest, triage, escalation, media, unanswered-request sweep |
 | `inbox/backfill.py`, `inbox/backfill_whatsapp.py` | 60-day history pulls |
-| `patches/*.patch` | Changes to voice-mode 8.12.0 (`simple_failover.py`, `tools/converse.py`): connect timeout, prompt-echo and hallucination guards, energy-gated VAD, speaker-gated end-of-turn, speaker filter on the listen window, Urdu-not-Hindi re-transcription |
-| `tools/heal_voicemode.py` | Re-applies / verifies the patches after `uv tool upgrade` |
+| `patches/*.patch` | Changes to voice-mode 8.12.0 (`simple_failover.py`, `tools/converse.py`): connect timeout, prompt-echo, URL and hallucination guards, energy-gated VAD with a noise floor taken from non-speech frames only, speaker-gated end-of-turn, optional speaker filter on the listen window, Urdu-not-Hindi re-transcription |
+| `tools/heal_voicemode.py` | Re-applies / verifies the patches after `uv tool upgrade`, and strips the 25-request limit from the Kokoro launchd plist (see Known limits) |
+| `tools/enrol/` | `enrol_record.py` (three minutes of you reading `enrolment_text.txt`), `enrol_embed.py` (builds the ECAPA and resemblyzer prints), `calibrate.py` (scores your recording, your own TTS and rejected room clips, suggests thresholds) |
 | `tools/tasks.py` | Task ledger (`add / start / done / block / list`) |
 | `tools/qr_render.py` | Renders a terminal QR (WhatsApp linking) to an image |
 | `launchd/*.plist` | launchd templates (`__HOME__` is substituted by `install.sh`) |
@@ -52,7 +53,7 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
 
 - macOS, the Claude desktop app (Code tab), Python 3.11 (a venv per `install.sh`)
 - [voice-mode](https://github.com/mbailey/voicemode) 8.12.0 installed with `uv tool`, with local whisper + Kokoro services
-- Python packages: `resemblyzer`, `webrtcvad`, `sounddevice`, `numpy`, `scipy`, `pyobjc-framework-ApplicationServices`, `pyobjc-framework-Quartz`, `pyobjc-framework-Cocoa`, `msal`, `pypdf`, `rumps`
+- Python packages: `speechbrain`, `torch`, `torchaudio` (ECAPA-TDNN, downloads ~80 MB of weights from Hugging Face on first run into `~/.voicemode/indicator/ecapa/`), `resemblyzer` (fallback), `webrtcvad`, `sounddevice`, `numpy`, `scipy`, `pyobjc-framework-ApplicationServices`, `pyobjc-framework-Quartz`, `pyobjc-framework-Cocoa`, `msal`, `pypdf`, `rumps`
 - Accessibility + Microphone grants for the daemon (macOS prompts on first run)
 - A public HTTPS hostname that forwards to this Mac (Cloudflare Tunnel public hostname → `http://<mac-lan-ip>:8898`, or Tailscale Funnel) for Graph push
 - A Microsoft 365 account; `inbox_hooks.py --login` runs a device-code sign-in with the Microsoft Graph Command Line Tools public client (delegated `Mail.Read Chat.Read ChatMessage.Read`). No app registration needed, but your tenant must allow that client.
@@ -62,7 +63,7 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
 
 1. `./install.sh`, creates the venv, installs packages, fills `launchd/*.plist` with your home path, copies them to `~/Library/LaunchAgents`.
 2. Copy `config.example.env` to `~/.voicemode/indicator/agent.env` and fill in your values (mailbox, own domain, escalation number, hostname, home session title, mic name, STT URLs).
-3. Enrol your voice: record ~70 s of natural speech and save the 256-dim resemblyzer embedding as `~/.voicemode/indicator/voiceprint.npy` (see `daemon/bargein_daemon.py::load_speaker_model`).
+3. Enrol your voice: `tools/enrol/enrol_record.py 180` while you read `tools/enrol/enrolment_text.txt` aloud (the daemon stays off the mic during it), then `tools/enrol/enrol_embed.py` writes `voiceprint_ecapa.npy` (and a resemblyzer print as fallback). Run `tools/enrol/calibrate.py` once to see how your voice, your TTS voice and room noise score, and set the thresholds in `agent.env` from that.
 4. Apply `patches/` to your voice-mode install (`patch -p1 -d <site-packages>`), then run `tools/heal_voicemode.py` to verify.
 5. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.voicemode.bargein.plist` and the same for `com.voicemode.inbox.plist`.
 6. `inbox_hooks.py --login`, write your public URL to `~/.voicemode/context/public_url.txt`; subscriptions are created and renewed automatically (`curl 127.0.0.1:8898/health`).
@@ -75,7 +76,7 @@ In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ..
 | Say / do | What happens |
 |---|---|
 | **"Hey Claude, open Amazon and YouTube in two tabs"** while Claude is busy | Wake word verified against your voiceprint, the whole sentence transcribed, pasted into the running session as `[voice] ...`; Claude's current speech or listen window is cut so it reads it within seconds |
-| Talk over Claude mid-sentence | Barge-in (speaker-verified). If Claude was not going to listen, the daemon records you and injects the words anyway |
+| Talk over Claude mid-sentence | Barge-in, verified against your ECAPA voiceprint and relative to the TTS voice, stop sent straight to voice-mode's control socket (well under a second). If that turn was going to listen, the mic is handed to voice-mode (red icon). If it was not, the daemon records you itself (icon red as well) and injects the words |
 | "Hey Claude" alone | Pastes the resume prompt into the existing session (context kept). A 4 s window accepts a follow-up command as the sentence |
 | Give three tasks in a row | Each becomes a background agent; results are spoken as they finish, whichever first |
 | New mail in a watched folder, a Teams message in one of the subscribed chats, a WhatsApp message | Arrives via push in seconds, appended to `context/inbox.jsonl`, `today.md` regenerated. Important ones (addressed to you, mentions, direct messages, high importance, client requests) are pushed into the session and spoken |
@@ -84,6 +85,18 @@ In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ..
 | **"Give All CVs this file and tell it to translate it"** | Daemon opens the *Chat and Cowork* tab, clicks the "All CVs" row, pastes the file as an attachment, types the instruction, returns to your Code session; the chat saves its output to a folder you watch |
 | "Brief me" / "what came in" | The agent reads `today.md` and speaks the important items first |
 | "What's pending?" | `tasks.py list open`, read aloud |
+
+## Speaker verification and interrupts
+
+The mic hears the TTS through the speakers, so loudness cannot decide what an interruption is. The daemon embeds the last 1.7 s with ECAPA-TDNN (`speechbrain/spkrec-ecapa-voxceleb`, 192 dims, about 20 ms per check on an Apple CPU) and compares it with your enrolment print and with a print of the TTS voice. Measured on our setup: the enrolled voice scores 0.5 to 0.8 clean and 0.3 to 0.4 while talking over the TTS; the TTS itself scores about 0.07; other people and a video playing in the room score 0.0 to 0.1. An interrupt is accepted when you clear the absolute bar (0.33), or when you clearly beat the TTS print (0.50 with a 0.04 margin, or 0.22 with a 0.15 margin, the second tier exists so acceptance does not wait for the score to climb). The wake word uses the same print at 0.30.
+
+Three rules that cost us a night to find, all in `bargein_daemon.py`:
+
+- A `[voice]` line reaches the agent at its next tool boundary, so the agent's next `converse` call is already the reply. The daemon only cuts speech whose tool call started before the injection landed; otherwise it was cutting every answer at 1.5 s and it looked like barge-in misfiring.
+- After a verified interrupt the daemon reads `wait_for_response` off voice-mode's `TOOL_REQUEST_START` event. True: hand the mic to voice-mode, which opens it a fixed 1.2 s after playback stops. False: record at once. A timed check raced voice-mode and stole interrupts as text.
+- Send the stop as one JSON line to `control.sock` (`{"command": "skip_forward"}`), not through the `voicemode control` CLI, which is a full Python start-up and cost about 3 s per stop.
+
+On the listening side the patched `converse.py` takes its noise floor from non-speech frames only (the upstream floor was sampled from your own first words and heard your next pause as the end of the take) and the silence threshold is 1.8 s, so people who pause to think are not cut off.
 
 ## How we run it (reference setup)
 
@@ -148,7 +161,9 @@ If you port it, please open an issue or a pull request with your UIA control nam
 ## Known limits
 
 - Injected messages surface at Claude's next tool boundary; the daemon cuts speech/listen windows to keep that under a few seconds, not instant.
-- Speaker verification (resemblyzer GE2E) is decent, not biometric: similar voices, or a TV, can score close to the enrolled voice. A stronger model (ECAPA) is a planned upgrade.
+- Speaker verification is not biometric. ECAPA separates you from the TTS and from other voices with a wide margin in our measurements, but audio playing in the room still delays acceptance by a second or two while your score climbs, and a very similar voice has not been tested.
+- voice-mode's Kokoro launchd template sets `UVICORN_LIMIT_MAX_REQUESTS=25`, so uvicorn exits cleanly after 25 requests and launchd restarts it; with a menu bar probing health that is a restart every ten minutes, seen as a blue icon with no sound, a line that dies mid-sentence, or an OpenAI failover error. Set `VOICEMODE_KOKORO_MAX_REQUESTS` high in `voicemode.env` (zero means exit at once) and let `heal_voicemode.py` strip the key from the plist.
+- Graph allows about 100 chat subscriptions per user. The receiver subscribes the 90 most recently active chats and polls the rest for new messages every two minutes, so a message in a dormant chat can take up to two minutes to arrive.
 - Sidebar navigation depends on the app's accessibility labels ("Chat and Cowork", row titles); an app update may rename them. `@@axtitles` dumps the current labels.
 - WhatsApp calls cannot be placed by any unofficial library. Old WhatsApp media may fail to download (expired on WhatsApp's servers).
 - Patches target voice-mode 8.12.0 exactly.

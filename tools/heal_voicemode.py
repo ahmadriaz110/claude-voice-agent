@@ -148,5 +148,41 @@ def heal() -> int:
     return 1
 
 
+def strip_kokoro_limit() -> None:
+    """Kokoro's launchd plist used to carry UVICORN_LIMIT_MAX_REQUESTS=25, so
+    uvicorn exited cleanly after 25 requests and the menu bar's health probes
+    restarted it every ~10 min (blue icon, no sound, OpenAI failover). The
+    key comes from VoiceMode's plist template via the service installer, so
+    an upgrade or reinstall brings it back. Strip it from both, every run."""
+    import plistlib
+    import subprocess
+    import os
+    for path, live in ((Path.home() / "Library/LaunchAgents/com.voicemode.kokoro.plist", True),
+                       (SITE / "templates/launchd/com.voicemode.kokoro.plist", False)):
+        if not path.exists():
+            continue
+        try:
+            raw = path.read_text()
+            if "UVICORN_LIMIT_MAX_REQUESTS" not in raw:
+                continue
+            if live:
+                d = plistlib.loads(path.read_bytes())
+                d.get("EnvironmentVariables", {}).pop("UVICORN_LIMIT_MAX_REQUESTS", None)
+                path.write_bytes(plistlib.dumps(d))
+                uid = os.getuid()
+                subprocess.run(["launchctl", "bootout", f"gui/{uid}/com.voicemode.kokoro"], capture_output=True)
+                subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], capture_output=True)
+                log("kokoro: request limit stripped from live plist and job reloaded")
+            else:
+                import re as _re
+                raw = _re.sub(r"\s*<key>UVICORN_LIMIT_MAX_REQUESTS</key>\s*<string>[^<]*</string>", "", raw)
+                path.write_text(raw)
+                log("kokoro: request limit stripped from the plist template")
+        except Exception as e:
+            log(f"kokoro: could not strip request limit from {path.name}: {e}")
+
+
 if __name__ == "__main__":
-    sys.exit(heal())
+    rc = heal()
+    strip_kokoro_limit()
+    sys.exit(rc)
