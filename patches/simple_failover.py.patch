@@ -34,8 +34,8 @@
 +# ("www.adblue.com", 2026-09-06). A whole transcript that is just a URL/domain
 +# is never user speech in this setup.
 +_VM_URL_HALLUCINATION = re.compile(r"(https?://)?(www\.)?[\w-]+(\.[\w-]+)+/?[.!?]?")
-+# Ahmad speaks English, Urdu and Punjabi, never Hindi. Whisper auto-detect
-+# renders his Urdu as Hindi (Devanagari) or Punjabi (Gurmukhi); re-run once
++# The user speaks English, Urdu and Punjabi, never Hindi. Whisper auto-detect
++# renders their Urdu as Hindi (Devanagari) or Punjabi (Gurmukhi); re-run once
 +# forced to Urdu so the transcript is in Urdu script.
 +_VM_URDU_NOT_HINDI = os.environ.get("VOICEMODE_URDU_NOT_HINDI", "1") not in ("0", "false", "False")
 +
