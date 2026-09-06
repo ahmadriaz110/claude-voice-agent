@@ -671,7 +671,7 @@ def is_important(item):
         return False, "group chatter"
     if ch == "whatsapp":
         if item.get("from_other_phone") and not item.get("from_me"):
-            item["from"] = "Ahmad (other phone)"
+            item["from"] = "the user (other phone)"
             try:
                 ACK_FILE.touch()
             except OSError:
