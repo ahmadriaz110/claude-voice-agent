@@ -1577,7 +1577,8 @@ def main():
                     _apps = _NRA.runningApplicationsWithBundleIdentifier_(CLAUDE_BUNDLE)
                     if _apps:
                         _c, _n, _s = _ax_find_composer(_apps[0].processIdentifier())
-                        log(f"ax probe: {_n} nodes, {len(_c)} inputs in {_s*1000:.0f}ms, retry queue {len(_retry_q)}")
+                        _fl = "on" if "--disable-backgrounding-occluded-windows" in subprocess.run(["ps", "-o", "command=", "-p", str(_apps[0].processIdentifier())], capture_output=True, text=True).stdout else "OFF"
+                        log(f"ax probe: {_n} nodes, {len(_c)} inputs in {_s*1000:.0f}ms, retry queue {len(_retry_q)}, occlusion flags {_fl}")
                     else:
                         log("ax probe: Claude not running")
                 except Exception as _e:
