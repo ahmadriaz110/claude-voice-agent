@@ -999,7 +999,16 @@ def _native_paste(text, dry_run=False):
                 break
         log(f"paste: window was closed; reopened -> {len(wins)} window(s)")
         _composer_cache["el"] = None          # new window, new elements
-        time.sleep(1.0)
+        # The fresh window renders its content a few seconds later; a fixed
+        # 1 s pause once found 13 nodes and no input, and the message waited
+        # for the 30 s retry. Wait for the composer itself, up to 8 s.
+        _t = time.time()
+        while time.time() - _t < 8.0:
+            time.sleep(0.5)
+            _cc, _nn, _ss = _ax_find_composer(pid)
+            if _pick_composer(_cc) is not None:
+                log(f"paste: composer ready {time.time()-_t:.1f}s after reopen ({_nn} nodes)")
+                break
     for w in wins:
         try:
             if _ax_attr(w, AS.kAXMinimizedAttribute):
