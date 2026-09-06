@@ -915,6 +915,31 @@ def _native_paste(text, dry_run=False):
         AS.AXUIElementSetMessagingTimeout(ax_app, 4.0)
     except Exception:
         pass
+    # A window closed with the red cross, or minimised, leaves the app running
+    # with nothing the daemon can paste into (that was the 2026-09-06 15:00
+    # loss). Restore it first: un-minimise over AX, and for a closed window
+    # send the app the reopen a Dock click sends, then wait for the window.
+    def _windows():
+        return list(_ax_attr(ax_app, AS.kAXWindowsAttribute) or [])
+    wins = _windows()
+    if not wins:
+        subprocess.run(["open", "-b", CLAUDE_BUNDLE], capture_output=True, timeout=10)
+        for _ in range(30):
+            time.sleep(0.2)
+            wins = _windows()
+            if wins:
+                break
+        log(f"paste: window was closed; reopened -> {len(wins)} window(s)")
+        _composer_cache["el"] = None          # new window, new elements
+        time.sleep(1.0)
+    for w in wins:
+        try:
+            if _ax_attr(w, AS.kAXMinimizedAttribute):
+                AS.AXUIElementSetAttributeValue(w, AS.kAXMinimizedAttribute, False)
+                log("paste: window was minimised; restored")
+                time.sleep(0.6)
+        except Exception:
+            pass
     el = _composer_cache["el"]
     if el is not None and _ax_attr(el, AS.kAXRoleAttribute) != "AXTextArea":
         el = _composer_cache["el"] = None          # stale after a reload
