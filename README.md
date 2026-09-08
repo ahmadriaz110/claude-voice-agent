@@ -44,6 +44,7 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
 | `inbox/backfill.py`, `inbox/backfill_whatsapp.py` | 60-day history pulls |
 | `patches/*.patch` | Changes to voice-mode 8.12.0 (`simple_failover.py`, `tools/converse.py`): connect timeout, prompt-echo, URL and hallucination guards, energy-gated VAD with a noise floor taken from non-speech frames only, speaker-gated end-of-turn, optional speaker filter on the listen window, Urdu-not-Hindi re-transcription |
 | `tools/heal_voicemode.py` | Re-applies / verifies the patches after `uv tool upgrade`, and strips the 25-request limit from the Kokoro launchd plist (see Known limits) |
+| `launchd/com.voicemode.micwatch.plist` | Runs `heal_voicemode.py --mic` every two minutes: if the barge-in daemon has been failing to open its microphone (PortAudio -9986 after a USB or CoreAudio blip, the wake word goes quiet while injection still works) it restarts the daemon and writes one line to `heal.log` |
 | `tools/enrol/` | `enrol_record.py` (three minutes of you reading `enrolment_text.txt`), `enrol_embed.py` (builds the ECAPA and resemblyzer prints), `calibrate.py` (scores your recording, your own TTS and rejected room clips, suggests thresholds) |
 | `tools/tasks.py` | Task ledger (`add / start / done / block / list`) |
 | `tools/qr_render.py` | Renders a terminal QR (WhatsApp linking) to an image |
@@ -65,7 +66,7 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
 2. Copy `config.example.env` to `~/.voicemode/indicator/agent.env` and fill in your values (mailbox, own domain, escalation number, hostname, home session title, mic name, STT URLs).
 3. Enrol your voice: `tools/enrol/enrol_record.py 180` while you read `tools/enrol/enrolment_text.txt` aloud (the daemon stays off the mic during it), then `tools/enrol/enrol_embed.py` writes `voiceprint_ecapa.npy` (and a resemblyzer print as fallback). Run `tools/enrol/calibrate.py` once to see how your voice, your TTS voice and room noise score, and set the thresholds in `agent.env` from that.
 4. Apply `patches/` to your voice-mode install (`patch -p1 -d <site-packages>`), then run `tools/heal_voicemode.py` to verify.
-5. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.voicemode.bargein.plist` and the same for `com.voicemode.inbox.plist`.
+5. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.voicemode.bargein.plist` and the same for `com.voicemode.inbox.plist` and `com.voicemode.micwatch.plist`.
 6. `inbox_hooks.py --login`, write your public URL to `~/.voicemode/context/public_url.txt`; subscriptions are created and renewed automatically (`curl 127.0.0.1:8898/health`).
 7. Register the WhatsApp webhook on your bridge: `POST /webhooks {url: http://127.0.0.1:8898/whatsapp, secret: <~/.voicemode/context/secret>}`.
 

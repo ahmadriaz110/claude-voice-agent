@@ -182,7 +182,95 @@ def strip_kokoro_limit() -> None:
             log(f"kokoro: could not strip request limit from {path.name}: {e}")
 
 
+
+
+# ---------------------------------------------------------------------------
+# Deaf-mic watch added 2026-09-08. The barge-in daemon can lose its input
+# stream after a USB/CoreAudio blip: PortAudio keeps a stale device list and
+# every reopen fails with PaErrorCode -9986, logged every 2 s as
+# "wake mic open failed" while injects keep working. Nothing recovers on its
+# own; a restart of the daemon re-enumerates devices and the mic opens again.
+# Run with --mic (every 2 min from com.voicemode.micwatch); logs only when it
+# acts, so heal.log stays readable.
+
+import os
+import subprocess
+import time
+
+BARGEIN_OUT = Path.home() / ".voicemode/indicator/bargein.out"
+BARGEIN_LABEL = "com.voicemode.bargein"
+MIC_FAIL = "wake mic open failed"
+MIC_FAILS_NEEDED = 5          # consecutive failures in the last lines
+MIC_RESTART_COOLDOWN = 300    # seconds; never restart a fresh daemon
+
+
+def _tail_lines(path: Path, n: int = 60) -> list[str]:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 64 * 1024))
+            return f.read().decode("utf-8", "replace").splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def _bargein_uptime() -> float | None:
+    """Seconds since the daemon process started, None if not running."""
+    try:
+        out = subprocess.run(["launchctl", "list", BARGEIN_LABEL], capture_output=True, text=True, timeout=10).stdout
+        m = re.search(r'"PID"\s*=\s*(\d+)', out)
+        if not m:
+            return None
+        et = subprocess.run(["ps", "-o", "etime=", "-p", m.group(1)], capture_output=True, text=True, timeout=10).stdout.strip()
+        if not et:
+            return None
+        # macOS etime: [[dd-]hh:]mm:ss
+        days, _, rest = et.rpartition("-")
+        parts = [int(x) for x in rest.split(":")]
+        secs = sum(v * 60 ** i for i, v in enumerate(reversed(parts)))
+        return secs + (int(days) * 86400 if days else 0)
+    except Exception:
+        return None
+
+
+def restart_deaf_bargein() -> int:
+    """Kickstart the barge-in daemon when its mic has been failing to open."""
+    lines = [l for l in _tail_lines(BARGEIN_OUT) if not l.startswith("||PaMacCore")]
+    recent = lines[-MIC_FAILS_NEEDED:]
+    if len(recent) < MIC_FAILS_NEEDED or not all(MIC_FAIL in l for l in recent):
+        return 0
+    # the last failure must be fresh, otherwise the daemon already moved on
+    m = re.match(r"\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\]", recent[-1])
+    if m:
+        age = time.time() - datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").timestamp()
+        if age > 120:
+            return 0
+    up = _bargein_uptime()
+    if up is None:
+        log("micwatch: daemon not running, leaving that to launchd")
+        return 0
+    if up < MIC_RESTART_COOLDOWN:
+        log(f"micwatch: mic failing but daemon only {int(up)}s old, waiting")
+        return 0
+    try:
+        subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{BARGEIN_LABEL}"], check=True, timeout=30)
+    except Exception as e:
+        log(f"micwatch: ERROR restarting daemon: {e}")
+        return 1
+    time.sleep(15)
+    after = [l for l in _tail_lines(BARGEIN_OUT, 40) if "starting; mic=" in l or "calibrated:" in l]
+    if after:
+        log(f"micwatch: mic was failing to open (PortAudio -9986), daemon restarted, now: {after[-1].split('] ',1)[-1]}")
+        return 0
+    log("micwatch: daemon restarted but no mic start line yet, check bargein.out")
+    return 1
+
+
 if __name__ == "__main__":
+    if "--mic" in sys.argv:
+        sys.exit(restart_deaf_bargein())
     rc = heal()
     strip_kokoro_limit()
+    rc = max(rc, restart_deaf_bargein())
     sys.exit(rc)

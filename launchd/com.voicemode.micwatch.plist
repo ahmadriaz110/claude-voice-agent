@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.voicemode.micwatch</string>
+
+    <!-- The barge-in daemon can lose its input stream after a USB or
+         CoreAudio blip: PortAudio keeps a stale device list and every reopen
+         fails with -9986, logged every 2 s as "wake mic open failed" while
+         message injection keeps working, so nothing looks wrong except that
+         the wake word is ignored. This runs the deaf-mic check every two
+         minutes and kickstarts the daemon when it has been failing. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.voicemode/indicator/.venv/bin/python</string>
+        <string>__HOME__/.voicemode/indicator/heal_voicemode.py</string>
+        <string>--mic</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.voicemode/indicator/heal.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.voicemode/indicator/heal.log</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>
