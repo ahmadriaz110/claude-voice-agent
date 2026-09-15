@@ -9,9 +9,29 @@ A hands-free, always-listening voice agent for **Claude Code on the Claude deskt
 - **Commands while Claude works.** Injected messages land mid-turn; the daemon shortens Claude's current speech or listen window so the message is read within seconds.
 - **Awareness.** A push receiver for Microsoft Graph change notifications (Outlook folders, Teams chats) and a WhatsApp webhook (Baileys bridge). Everything is logged to a digest; important items are pushed into the live session; unanswered ones are escalated to a second WhatsApp number, whose text or voice-note replies come back as instructions.
 - **Driving trained chats.** Open a named session in the app's *Chat and Cowork* tab by its sidebar title, attach a file, type an instruction, return. Chat replies cannot be read by tools, so instructions ask the chat to save results into a watched folder.
-- **Task ledger**, backfill scripts for 60 days of mail/Teams/WhatsApp history, and a self-healing check for the voicemode patches.
+- **Calls.** When a Teams or WhatsApp call starts, the voice agent goes quiet and stays off the mic; a small CoreAudio helper records your side and the remote side, and a transcript lands in the session when the call ends.
+- **Knowing what you already did.** A 12-minute check lists your own recent sends (WhatsApp, Teams, mail) so the agent stops re-raising things you handled yourself; a menu-bar "At desk / Away" toggle tells it whether to speak or message your phone.
+- **Task ledger**, backfill scripts for 60 days of mail/Teams/WhatsApp history, and a self-healing check for the voicemode patches (deaf mic, mute TTS).
 
 Everything runs on the Mac. Speech-to-text and text-to-speech are OpenAI-compatible local endpoints (whisper.cpp / Kokoro via [voice-mode](https://github.com/mbailey/voicemode)); a LAN GPU box can serve whisper `large-v3`.
+
+## What's new (September 2026)
+
+The first release (6 September) was the voice loop plus the mail, Teams and WhatsApp awareness. Since then the stack has been running all day, every day, and most of what changed came from things that went wrong in use.
+
+- **Outgoings check** (`tools/outgoings.py`). The agent kept re-raising threads I had already answered myself from my phone or from Outlook. The receiver only ever saw inbound traffic, and the bridge cannot tell my sends from the agent's (same account). Now every send the agent makes goes through `tools/wa_send.sh` or `inbox_hooks._wa_send`, which log the text to `agent_sent_ids.jsonl`; every 12 minutes the session runs `outgoings.py`, which reads the WhatsApp desktop app's ChatStorage, the Teams chats and Sent Items over Graph, subtracts the agent's own sends, redacts anything that looks like a credential, and hands the list to the session. The rule in `docs/PROTOCOL.md` is simple: read it before answering anyone.
+- **DNS-over-HTTPS fallback** (`daemon/dns_fallback.py`). Twice in two days the Mac's resolvers went silent on UDP 53 while HTTPS itself was fine, so every Graph and MSAL call died on name resolution and the relay went blind without any error that looked like a network fault. The module monkeypatches `socket.getaddrinfo`: normal resolution first, and only on failure a DoH query to a resolver reached by IP, cached five minutes, DoH-first for two minutes after a failure because the system resolver takes about 30 s to give up each time. One import line at the top of the receiver, the call watch and `outgoings.py`.
+- **Call watcher** (`callwatch/`). When a Teams or WhatsApp call comes in the voice agent has to go quiet at once, stay off the microphone, and still know what was said. `call_watch.py` polls CoreAudio every 2 s for the process objects of the two apps and reads whether they are running input and output; both together for 20 s is a call (a voice note being recorded also opens both for a few seconds, which is why it is 20 and not 3). It writes `call_active.json`, which the barge-in daemon checks once a second and treats as "do not touch the mic"; it injects `[call] started`; and it starts `audiotap`, a small Swift binary that records the mic through an IOProc and the remote side through a CoreAudio process tap wrapped in a private aggregate device (macOS 14.2+, no BlackHole, no loopback device), 16 kHz mono WAV in 10-minute chunks, supervised and restarted at the next chunk number if it dies. When the app releases the mic for 8 s the call ends, `[call] ended` is injected, and the chunks go to whisper in 90 s pieces with retries (one 10-minute upload used to hold the STT server for minutes and took it down when the client gave up). `transcript.txt` is one line per segment tagged MIC or REMOTE; `[call] transcript ready` tells the agent where it is. The daemon no longer cuts speech for `[inbox]` or `[call]` lines, because those are background reads, not you talking.
+- **Group watcher** (`tools/watch_group.py`). For a live job with its own WhatsApp group, a monitor runs this script and each new message arrives in the session as one event line, without subscribing the whole inbox to the group.
+- **HTML mail helper** (`tools/send_mail.py`, `tools/mail_html.py`). A mail once went out with a hand-typed compact signature. `build_body` now builds every body from the stored signature template and refuses to build one when the template is missing or fails a marker check; `mail_html.build` is the lenient variant with an env-driven fallback block. The template itself is private and lives outside the repo.
+- **Receiver triage.** Courtesy closings ("Thank you!", "Noted, will update the customer") are no longer flagged as unanswered requests: the receiver strips the quoted thread, greeting and signature and looks at the sender's own words. Supplier offers (a profile, a rate card) carry no reply SLA. A request answered on a sibling thread counts as answered (Sent Items are checked for anything sent to that sender within the SLA window). Teams mentions match the Graph user id, not a bare first name. A chat item is held 75 s and dropped if you read it yourself. Replies in a group you posted in, and follow-ups after someone tagged you, are pushed like mentions. Status broadcasts and protocol placeholders are ignored.
+- **Presence and quiet mode.** The menu bar has an At desk / Away toggle; the receiver injects a `[presence]` line when it flips. `~/.voicemode/quiet.json` makes the receiver log everything and inject nothing, for a digest read on demand.
+- **Daemon hardening.** Injected text is persisted to `inject_pending.jsonl` before anything is done with it and replayed after a restart (an instruction was lost once when the daemon restarted three seconds after reading it). A collapsed sidebar is opened before a session row is looked for. `@@axcopy` reads a chat's last reply back through its Copy button. The two-minute health check also restarts a Kokoro that answers 200 with an empty body.
+- **Bridge patch.** `whatsapp-bridge/daemon.js.send-media.patch` now also sends voice notes (`audio` path, Ogg/Opus with `ptt`) and text with `mentions`.
+
+### What this setup does day to day
+
+The Mac sits on the desk with the headset on. Mail, Teams and WhatsApp arrive through the receiver; what matters is spoken, what does not goes into the digest. I answer some things myself from the phone or from Outlook, and the outgoings check keeps the agent from chasing those. When a call comes in, the agent stops talking, the watcher records both sides, and ten minutes after the call there is a transcript in the session to summarise or act on. Away from the desk, the menu-bar toggle sends replies to my other phone instead, and the same phone can send instructions back, as text or as a voice note. A cheap triage subagent reads the digest every so often with `digest_brief.py` and reports only what needs a decision. The rest is the voice loop from the first release: wake word, barge-in, background agents, a task ledger.
 
 ## What it feels like, honestly
 
@@ -26,11 +46,18 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
  Claude ◄──┘                                                      │
    ▲  converse (voice-mode MCP, patched)                          │
    │                                                              │
- inbox_hooks.py (:8898, behind a Cloudflare/Tailscale hostname) ──┘
+ inbox_hooks.py (:8898, behind a Cloudflare/Tailscale hostname) ──┤
    ├── Graph change notifications: mail folders + per-chat Teams subscriptions (auto-renew)
    ├── WhatsApp webhook (Baileys daemon on 127.0.0.1:47823, HMAC-signed), media + whisper for voice notes
    ├── inbox.jsonl / today.md digest, escalation to a second WhatsApp number, ack file
-   └── sweep: client requests unanswered by your domain for N hours
+   ├── sweep: client requests unanswered by your domain for N hours
+   └── presence.json watch ("[presence]" lines), quiet.json (log only, inject nothing)
+                                                                    │
+ call_watch.py (launchd) ── audiotap (CoreAudio process tap + mic) ─┘  "[call] started / ended / transcript ready"
+   └── call_active.json while a call is on: the daemon stays off the mic
+
+ outgoings.py (every 12 min): your own sends across WhatsApp / Teams / Sent Items, handed to the session
+ dns_fallback.py: DNS-over-HTTPS when the system resolver dies (imported by the receiver, the call watch, outgoings)
 ```
 
 ## Components
@@ -39,12 +66,21 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
 |---|---|
 | `daemon/bargein_daemon.py` | Wake word, barge-in, post-interrupt capture, ECAPA speaker verification (with a resemblyzer fallback) and the verify server voice-mode calls, native AX paste into the Claude composer, `@@session=` named-session commands, `@@axtitles` label dump |
 | `daemon/launcher.c` | Tiny fork-not-exec launcher so the daemon keeps its own macOS TCC (Accessibility / Microphone) identity |
-| `daemon/voicemode_indicator.py` | rumps menu-bar indicator (listening / thinking / speaking) |
-| `inbox/inbox_hooks.py` | Push receiver: Graph subscriptions, WhatsApp webhook, digest, triage, escalation, media, unanswered-request sweep |
+| `daemon/voicemode_indicator.py` | rumps menu-bar indicator (listening / thinking / speaking), the At desk / Away presence toggle (`~/.voicemode/presence.json`) |
+| `daemon/dns_fallback.py` | `import dns_fallback` at the top of a daemon wraps `socket.getaddrinfo`: normal resolution first, DNS-over-HTTPS by IP when the system resolver fails, DoH-first for two minutes after a failure, five-minute cache |
+| `inbox/inbox_hooks.py` | Push receiver: Graph subscriptions, WhatsApp webhook, digest, triage, escalation, media, unanswered-request sweep (courtesy-reply and vendor-offer filters, sibling-thread answers via Sent Items), read-check before injecting, presence watch, quiet mode |
 | `inbox/backfill.py`, `inbox/backfill_whatsapp.py` | 60-day history pulls |
+| `callwatch/call_watch.py` | Detects a live Teams / WhatsApp call over CoreAudio, records both sides through `audiotap`, writes `call_active.json` so the daemon stays off the mic, transcribes afterwards (90 s pieces, retries), injects `[call] started / ended / transcript ready` |
+| `callwatch/audiotap/` | Swift helper (`main.swift`, `build.sh`, `embedded-Info.plist`): CoreAudio process tap on the app's process objects plus a mic IOProc, 16 kHz mono WAV chunks, JSON progress on stdout; re-spawns as its own TCC identity so the Microphone and System Audio Recording prompts are attributed to it |
+| `tools/outgoings.py` | Your own sends in the last N minutes across WhatsApp (the desktop app's ChatStorage), Teams and Sent Items (Graph), minus what the agent sent; credential-looking short messages are redacted. Run on a 12-minute cron |
+| `tools/watch_group.py` | Follows one WhatsApp group from ChatStorage and prints each new message as an event line, for a monitor that feeds a live job's chat into the session |
+| `tools/send_mail.py`, `tools/mail_html.py` | HTML mail bodies with your stored signature template (`~/.voicemode/templates/signature.html`, private): `send_mail.build_body` refuses when the template is missing or fails the marker check, `mail_html.build` falls back to a plain block from env |
+| `tools/wa_send.sh` | Bridge send helper: text, document, image, voice note (`audio` + `ptt`); logs what the agent sent to `agent_sent_ids.jsonl` so the digest and `outgoings.py` can tell the agent's messages from yours |
+| `tools/presence.py`, `tools/digest_brief.py`, `tools/digest.sh` | Shell-readable presence flag; compact digest views for a triage subagent (your sends marked `YOU (sent)`, the agent's `AGENT (sent)`) |
 | `patches/*.patch` | Changes to voice-mode 8.12.0 (`simple_failover.py`, `tools/converse.py`): connect timeout, prompt-echo, URL and hallucination guards, energy-gated VAD with a noise floor taken from non-speech frames only, speaker-gated end-of-turn, optional speaker filter on the listen window, Urdu-not-Hindi re-transcription |
-| `tools/heal_voicemode.py` | Re-applies / verifies the patches after `uv tool upgrade`, and strips the 25-request limit from the Kokoro launchd plist (see Known limits) |
-| `launchd/com.voicemode.micwatch.plist` | Runs `heal_voicemode.py --mic` every two minutes: if the barge-in daemon has been failing to open its microphone (PortAudio -9986 after a USB or CoreAudio blip, the wake word goes quiet while injection still works) it restarts the daemon and writes one line to `heal.log` |
+| `tools/heal_voicemode.py` | Re-applies / verifies the patches after `uv tool upgrade`, strips the 25-request limit from the Kokoro launchd plist (see Known limits), restarts a deaf barge-in daemon (`--mic`) and a mute Kokoro (`--tts`) |
+| `launchd/com.voicemode.micwatch.plist` | Runs `heal_voicemode.py --mic` every two minutes: if the barge-in daemon has been failing to open its microphone (PortAudio -9986 after a USB or CoreAudio blip, the wake word goes quiet while injection still works) it restarts the daemon and writes one line to `heal.log`. The same run posts a one-line TTS request to Kokoro; a 200 with an empty body means Kokoro is wedged mute (launchd sees it as healthy) and it is kickstarted, at most once per five minutes |
+| `launchd/com.voicemode.callwatch.plist` | Keeps `call_watch.py` running (KeepAlive, RunAtLoad); ffmpeg's Homebrew path is added because launchd agents get a bare PATH |
 | `tools/enrol/` | `enrol_record.py` (three minutes of you reading `enrolment_text.txt`), `enrol_embed.py` (builds the ECAPA and resemblyzer prints), `calibrate.py` (scores your recording, your own TTS and rejected room clips, suggests thresholds) |
 | `tools/tasks.py` | Task ledger (`add / start / done / block / list`) |
 | `tools/qr_render.py` | Renders a terminal QR (WhatsApp linking) to an image |
@@ -54,23 +90,27 @@ Close to ChatGPT's voice mode, with Claude Code doing the work: you talk, it tal
 
 - macOS, the Claude desktop app (Code tab), Python 3.11 (a venv per `install.sh`)
 - [voice-mode](https://github.com/mbailey/voicemode) 8.12.0 installed with `uv tool`, with local whisper + Kokoro services
-- Python packages: `speechbrain`, `torch`, `torchaudio` (ECAPA-TDNN, downloads ~80 MB of weights from Hugging Face on first run into `~/.voicemode/indicator/ecapa/`), `resemblyzer` (fallback), `webrtcvad`, `sounddevice`, `numpy`, `scipy`, `pyobjc-framework-ApplicationServices`, `pyobjc-framework-Quartz`, `pyobjc-framework-Cocoa`, `msal`, `pypdf`, `rumps`
+- Python packages: `speechbrain`, `torch`, `torchaudio` (ECAPA-TDNN, downloads ~80 MB of weights from Hugging Face on first run into `~/.voicemode/indicator/ecapa/`), `resemblyzer` (fallback), `webrtcvad`, `sounddevice`, `numpy`, `scipy`, `pyobjc-framework-ApplicationServices`, `pyobjc-framework-Quartz`, `pyobjc-framework-Cocoa`, `msal`, `pypdf`, `rumps`, `requests`
 - Accessibility + Microphone grants for the daemon (macOS prompts on first run)
+- For the call watch: macOS 14.2 or later (CoreAudio process taps), the Xcode command line tools (`swiftc`) to build `audiotap`, `ffmpeg` from Homebrew, and the WhatsApp desktop app if you want `outgoings.py` and `watch_group.py` to read its ChatStorage
 - A public HTTPS hostname that forwards to this Mac (Cloudflare Tunnel public hostname → `http://<mac-lan-ip>:8898`, or Tailscale Funnel) for Graph push
 - A Microsoft 365 account; `inbox_hooks.py --login` runs a device-code sign-in with the Microsoft Graph Command Line Tools public client (delegated `Mail.Read Chat.Read ChatMessage.Read`). No app registration needed, but your tenant must allow that client.
 - A Baileys WhatsApp bridge exposing `/status /qr /send /chats /messages /media /webhooks` on `127.0.0.1:47823` (the `daemon.js` in `whatsapp-bridge/` notes describe the routes this receiver expects; the bridge itself is not included)
 
 ## Setup (short form)
 
-1. `./install.sh`, creates the venv, installs packages, fills `launchd/*.plist` with your home path, copies them to `~/Library/LaunchAgents`.
-2. Copy `config.example.env` to `~/.voicemode/indicator/agent.env` and fill in your values (mailbox, own domain, escalation number, hostname, home session title, mic name, STT URLs).
+1. `./install.sh`, creates the venv, installs packages, fills `launchd/*.plist` with your home path, copies them to `~/Library/LaunchAgents`, and builds `audiotap` when `swiftc` is present.
+2. Copy `config.example.env` to `~/.voicemode/indicator/agent.env` and fill in your values (mailbox, your name parts, own domain, client and vendor domains, escalation number, hostname, home session title, mic name, STT URLs, time zone).
 3. Enrol your voice: `tools/enrol/enrol_record.py 180` while you read `tools/enrol/enrolment_text.txt` aloud (the daemon stays off the mic during it), then `tools/enrol/enrol_embed.py` writes `voiceprint_ecapa.npy` (and a resemblyzer print as fallback). Run `tools/enrol/calibrate.py` once to see how your voice, your TTS voice and room noise score, and set the thresholds in `agent.env` from that.
 4. Apply `patches/` to your voice-mode install (`patch -p1 -d <site-packages>`), then run `tools/heal_voicemode.py` to verify.
 5. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.voicemode.bargein.plist` and the same for `com.voicemode.inbox.plist` and `com.voicemode.micwatch.plist`.
 6. `inbox_hooks.py --login`, write your public URL to `~/.voicemode/context/public_url.txt`; subscriptions are created and renewed automatically (`curl 127.0.0.1:8898/health`).
 7. Register the WhatsApp webhook on your bridge: `POST /webhooks {url: http://127.0.0.1:8898/whatsapp, secret: <~/.voicemode/context/secret>}`.
+8. Call watch: `python callwatch/call_watch.py --test-record 10` once from a terminal to trigger the two macOS prompts for `audiotap` (Microphone, and System Audio Recording Only under Privacy & Security > Screen & System Audio Recording), check the WAVs it reports, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.voicemode.callwatch.plist`. `--dry-run` prints what CoreAudio sees.
+9. Mail signature: save your signature block's HTML to `~/.voicemode/templates/signature.html` and set `MAIL_SIGNATURE_MARKER` to a string that must appear in it (your surname in capitals). `send_mail.build_body` refuses to build a mail when the file is missing or the marker is absent.
+10. Outgoings: have the session run `tools/outgoings.py --min 15` every 12 minutes (a `/loop 12m` in Claude Code is how the reference setup does it) and before it answers anyone; an external cron can do the same and write the output into `inject.txt` prefixed `[inbox] outgoings:`.
 
-In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ...` and `[inbox] ...` lines as spoken input and live alerts. A short protocol for that is in `docs/PROTOCOL.md`.
+In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ...` and `[inbox] ...` lines as spoken input and live alerts, `[call] ...` lines as call notices and `[presence] ...` lines as a channel switch. A short protocol for that is in `docs/PROTOCOL.md`.
 
 ## Features, with the commands that drive them
 
@@ -84,12 +124,19 @@ In Claude, keep the voice loop alive with the `converse` tool; treat `[voice] ..
 | Give three tasks in a row | Each becomes a background agent; results are spoken as they finish, whichever first |
 | New mail in a watched folder, a Teams message in one of the subscribed chats, a WhatsApp message | Arrives via push in seconds, appended to `context/inbox.jsonl`, `today.md` regenerated. Important ones (addressed to you, mentions, direct messages, high importance, client requests) are pushed into the session and spoken |
 | You don't answer an important alert for 20 s | The same line is sent to your second WhatsApp number. Reply by text or **voice note**; it comes back as an instruction (voice notes transcribed, Devanagari re-run as Urdu) |
-| A client request sits unanswered by your domain for 2 h | Flagged as `UNANSWERED Nh` and escalated like any important item |
-| **"Give All CVs this file and tell it to translate it"** | Daemon opens the *Chat and Cowork* tab, clicks the "All CVs" row, pastes the file as an attachment, types the instruction, returns to your Code session; the chat saves its output to a folder you watch |
+| A client request sits unanswered by your domain for 2 h | Flagged as `UNANSWERED Nh` and escalated like any important item. Not flagged: a "Thank you!" or "Noted, will update" whose own words (quoted thread, greeting and signature stripped) are nothing but courtesy phrases; a supplier's rate or candidate profile (`INBOX_VENDOR_DOMAINS`, vendor phrases); a request you answered on a sibling thread (anything you sent to that sender within the SLA window counts, checked in Sent Items) |
+| A Teams or WhatsApp message arrives and you read it yourself within 75 s | Not injected. The receiver waits `INBOX_READ_GRACE_S`, then checks the Teams chat viewpoint or the bridge's unread count; a message you have read is yours to handle |
+| A reply lands in a group where you or the agent posted in the last 24 h, or a sender keeps writing after tagging you | Treated as part of a thread you opened (`reply in a thread you posted in`, `follow-up to their tag of you`) and pushed like a mention; on a tag, that sender's messages from the three minutes before are attached |
+| A Teams or WhatsApp call starts | Within 20 s the call watch writes `call_active.json`; the daemon disarms, stops listening for the wake word and never opens the mic while the file exists. `[call] started: WhatsApp at 14:02` reaches the session and the agent goes quiet. `audiotap` records `mic-NNN.wav` and `remote-NNN.wav` in 10-minute chunks under `~/.voicemode/calls/<stamp>-<app>/`. When the app releases the mic for 8 s: `[call] ended: ... transcript pending`, then each chunk goes to whisper in 90 s pieces and `[call] transcript ready: <path> (N words)` follows; the agent summarises the transcript, the watcher never does |
+| You click **At desk** or **Away** in the menu bar | `presence.json` flips and the receiver injects `[presence] The user is now AWAY: reply on WhatsApp +<second number>, the user is away`; the agent switches channel instead of talking to an empty room |
+| Every 12 minutes | `outgoings.py` lists what you sent yourself in the last 15 minutes on WhatsApp, Teams and mail (the agent's own tagged sends excluded), so a thread you already closed is not raised again |
+| `~/.voicemode/quiet.json` exists | Nothing is injected or escalated; everything still lands in the digest, read on demand with `digest.sh` or `digest_brief.py` |
+| **"Give My translator chat this file and tell it to translate it"** | Daemon opens the *Chat and Cowork* tab, clicks the "My translator chat" row, pastes the file as an attachment, types the instruction, returns to your Code session; the chat saves its output to a folder you watch. `@@axcopy=<Tab>><Row>;back=...` presses the last "Copy" action in that chat and saves the clipboard to `ax_copy.txt` when a reply must be read back |
 | "Brief me" / "what came in" | The agent reads `today.md` and speaks the important items first |
 | "What's pending?" | `tasks.py list open`, read aloud |
 | "Answer me in Urdu" | The whole reply is spoken by Kokoro's Hindi voice (`hf_alpha`), written by the agent in Devanagari, so no transliteration step. One language per reply; mixed-language input is whisper's job. The Perso-Arabic sounds flatten to their Hindi neighbours |
 | A WhatsApp message from your second number | Treated as an instruction (text or voice note). Results, including files and images, go back to that number through the bridge's `/send` |
+| A status update as a voice note | Write the script in plain spoken English (numbers written out, initialisms spaced so they are read as letters), generate it with local Kokoro (`POST /v1/audio/speech`, `response_format: mp3`), convert with `ffmpeg -i in.mp3 -c:a libopus -b:a 32k -ar 48000 -ac 1 out.ogg`, and send it with `tools/wa_send.sh '{"phone":"...","audio":"/abs/out.ogg","mimetype":"audio/ogg; codecs=opus","ptt":true}'`. It shows as a real voice message. English only: Kokoro's English voice reading Roman Urdu is not intelligible to a native speaker |
 
 ## Speaker verification and interrupts
 
@@ -114,7 +161,7 @@ On the listening side the patched `converse.py` takes its noise floor from non-s
 
 ## WhatsApp bridge
 
-The receiver expects a small local Baileys bridge on `127.0.0.1:47823` with these routes: `GET /status`, `GET /qr` (also writes a PNG), `POST /send {phone, message, image?, document?}` (`image` / `document` is a path on this machine, `message` becomes the caption), `GET /chats`, `GET /messages?phone=&limit=` (each item with `id`, `type`, `from`, `text`, `timestamp`), `GET /media?phone=&id=` (raw bytes + content type), and `POST /webhooks {url, events, secret}` delivering `{event, timestamp, data:{chatJid,isGroup,fromMe,author,text,messageId,timestamp,type}}` signed with `X-WA-Signature: sha256=<hmac>`. `whatsapp-bridge/daemon.js.patch` adds the `/media` route and the `id`/`type` fields, and `daemon.js.send-media.patch` adds image and document sending, to a bridge built on [Baileys](https://github.com/WhiskeySockets/Baileys) with `syncFullHistory: true`. Link the device by scanning the QR from `tools/qr_render.py`'s image or the bridge's PNG; a phone-side "couldn't link" usually means a second copy of the bridge is fighting for the port, or a stale session directory.
+The receiver expects a small local Baileys bridge on `127.0.0.1:47823` with these routes: `GET /status`, `GET /qr` (also writes a PNG), `POST /send {phone, message, image?, document?}` (`image` / `document` is a path on this machine, `message` becomes the caption), `GET /chats`, `GET /messages?phone=&limit=` (each item with `id`, `type`, `from`, `text`, `timestamp`), `GET /media?phone=&id=` (raw bytes + content type), and `POST /webhooks {url, events, secret}` delivering `{event, timestamp, data:{chatJid,isGroup,fromMe,author,text,messageId,timestamp,type}}` signed with `X-WA-Signature: sha256=<hmac>`. `whatsapp-bridge/daemon.js.patch` adds the `/media` route and the `id`/`type` fields, and `daemon.js.send-media.patch` adds image, document and audio sending (`audio` is a path; an `.ogg`/`.opus` file goes out as a voice note with `ptt: true`, anything else as a playable audio file) plus `mentions` (a list of jids whose `@number` tags appear in the text), to a bridge built on [Baileys](https://github.com/WhiskeySockets/Baileys) with `syncFullHistory: true`. Link the device by scanning the QR from `tools/qr_render.py`'s image or the bridge's PNG; a phone-side "couldn't link" usually means a second copy of the bridge is fighting for the port, or a stale session directory.
 
 ## Windows and Linux
 
@@ -160,8 +207,10 @@ If you port it, please open an issue or a pull request with your UIA control nam
 
 - Everything stays local except Graph/WhatsApp traffic to their own services and STT/TTS to endpoints you choose.
 - The receiver validates Graph `clientState` and WhatsApp HMAC signatures; unsigned WhatsApp posts are rejected because the endpoint is reachable through your tunnel.
-- Do **not** commit: `voiceprint.npy`, `msal_cache.json`, `context/secret`, `context/*.jsonl`, `context/media/`, `history/`, or any memory files. `.gitignore` covers them.
+- Do **not** commit: `voiceprint.npy`, `msal_cache.json`, `context/secret`, `context/*.jsonl`, `context/media/`, `history/`, `calls/`, `templates/signature.html`, `agent_sent_ids.jsonl`, or any memory files. `.gitignore` covers them.
 - The daemon types into the Claude composer with your Accessibility grant. A mis-transcription becomes an instruction; keep the `[voice]` prefix so the agent confirms anything destructive.
+- The call watch records both sides of your calls to disk and sends the audio to whatever whisper endpoint you configure. Recording calls has legal conditions that differ by country; tell the people on the call, and keep the whisper endpoint on your own machines.
+- `outgoings.py` reads the WhatsApp desktop app's local database (a copy, WAL included) and redacts short messages that look like a credential before printing; it prints the rest of your sends verbatim into the session.
 
 ## Known limits
 
@@ -174,6 +223,9 @@ If you port it, please open an issue or a pull request with your UIA control nam
 - Patches target voice-mode 8.12.0 exactly.
 - A Claude window closed with the red cross, or minimised, leaves the app running with no window the daemon can paste into (three messages were lost that way once: the daemon saw no window at all, fell back to blind keystrokes, and logged them as sent). The daemon now un-minimises the window over accessibility and, for a closed window, sends the app the reopen a Dock click sends, waits for the window, and then pastes; both cases tested at 3 to 4 s. Injected text is now never sent blind. A failed paste goes to a retry queue (every 30 s for 15 min), a confirmed paste writes `~/.voicemode/context/delivered`, the receiver tells the second phone after 90 s without that marker, and the daemon messages it if the retries run out. An `ax probe` line every 10 minutes in `bargein.log` shows how many nodes and inputs the app exposes.
 - Kokoro's Hindi voices work through the plain `converse` message path (`voice="hf_alpha"`). Inside a pipelined `turns` survey the same voice comes back as `tts_failed` before any request reaches Kokoro; speak Urdu replies as single calls.
+- Call watch: the process tap needs macOS 14.2 or later and a "System Audio Recording Only" grant for `audiotap`; without the binary, `call_watch.py` still detects calls over ctypes and silences the agent, but records nothing. The tap's aggregate device only ticks while the tapped app produces output, so the remote file starts when the other side first makes a sound. The start rule (mic and output together for 20 s) means the first 20 s of a call are not recorded and a long voice note can look like a call for a moment. Teams helper processes come and go during a call; the tap list is refreshed every 5 s and on macOS 26 the description also carries the bundle ids, so a helper that respawns is picked up. `--test-record` and `--dry-run` are the two checks worth running after an OS update.
+- `dns_fallback.py` only resolves A records (IPv4) and only for the hosts a daemon asks for after the system resolver has failed; it is a stopgap for a dead resolver, not a resolver.
+- `outgoings.py` and `watch_group.py` read the WhatsApp desktop app's ChatStorage schema (`ZWAMESSAGE`, `ZWACHATSESSION`, `ZWAGROUPMEMBER`); a WhatsApp update that changes it breaks them until the queries are adjusted.
 
 ## Credits
 
