@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.voicemode.callwatch</string>
+
+    <!-- Teams / WhatsApp call watch: detects a live call over CoreAudio, records
+         mic + a process tap through ./audiotap/audiotap, notifies the Claude
+         session via the barge-in daemon's inject.txt, transcribes afterwards.
+         Same venv python as the other voicemode daemons. The audio recorder is
+         the separate audiotap binary (its own TCC identity: Microphone +
+         System Audio Recording), so python itself needs no new permission.
+         Source agent.env here (CALLWATCH_WHISPER_URL, CALLWATCH_MIC, AGENT_TZ)
+         through EnvironmentVariables, as for the other plists. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.voicemode/indicator/.venv/bin/python</string>
+        <string>__HOME__/.voicemode/indicator/call_watch.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it dies: a dead call watch is invisible until a call goes
+         unrecorded. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- launchd gives agents a bare PATH; ffmpeg from Homebrew lives outside it. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- The script writes its own log to callwatch.log; stdout/stderr only carry
+         uncaught tracebacks. -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/.voicemode/indicator/callwatch.out</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.voicemode/indicator/callwatch.err</string>
+</dict>
+</plist>

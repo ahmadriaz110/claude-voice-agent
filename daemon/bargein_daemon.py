@@ -68,8 +68,24 @@ PAUSE_FLAG = HOME / ".voicemode" / "indicator" / "paused.flag"
 # does not listen). The menu bar shows it as Listening, so an interrupt
 # looks the same to him whichever side holds the mic.
 CAPTURE_FLAG = HOME / ".voicemode" / "indicator" / "daemon_capture.flag"
-# Touched whenever this daemon verifies HIS voice (barge-in fire, wake, capture).
-# inbox_hooks reads its mtime as "he responded" before escalating to WhatsApp.
+# Written by call_watch.py while a Teams/WhatsApp call is live (it records the
+# call itself). While it exists this daemon must not touch the mic at all: no
+# wake-word listening, no barge-in arming. The user's rule: whenever a call
+# comes in over WhatsApp or Teams, go silent automatically.
+CALL_ACTIVE_FLAG = HOME / ".voicemode" / "indicator" / "call_active.json"
+_call_active_cache = [0.0, False]
+
+
+def _call_active():
+    # One stat per second, not per 30 ms frame.
+    now = time.time()
+    if now - _call_active_cache[0] >= 1.0:
+        _call_active_cache[0] = now
+        _call_active_cache[1] = CALL_ACTIVE_FLAG.exists()
+    return _call_active_cache[1]
+# Touched whenever this daemon verifies the user's voice (barge-in fire, wake,
+# capture). inbox_hooks reads its mtime as "the user responded" before
+# escalating to WhatsApp.
 ACK_FILE = HOME / ".voicemode" / "context" / "ack"
 
 
@@ -869,6 +885,13 @@ def switch_session(title):
     time.sleep(0.3)
     el = _ax_find_titled(app.processIdentifier(), title)
     if el is None:
+        # A collapsed sidebar renders no session rows at all; open it and look again.
+        sb = _ax_find_titled(app.processIdentifier(), "Show sidebar")
+        if sb is not None and _ax_press(sb):
+            log("switch_session: sidebar was hidden, opened it")
+            time.sleep(0.9)
+            el = _ax_find_titled(app.processIdentifier(), title)
+    if el is None:
         log(f"switch_session: no sidebar entry containing {title!r}")
         return False
     ok = _ax_press(el)
@@ -1164,6 +1187,50 @@ RETRY_MAX = int(os.environ.get("BARGEIN_RETRY_MAX", 30))          # 30 x 30 s = 
 NOTIFY_WA = os.environ.get("BARGEIN_NOTIFY_WA", "")               # digits; empty disables
 WA_SEND_URL = os.environ.get("BARGEIN_WA_SEND_URL", "http://127.0.0.1:47823/send")
 _retry_q = []          # [{"text", "attempts", "next_at", "why"}]
+PENDING_PATH = HOME / ".voicemode" / "indicator" / "inject_pending.jsonl"
+
+
+def _pending_add(text):
+    """Injected text is written here BEFORE anything is done with it and
+    removed only after a confirmed paste. Once the daemon read an instruction,
+    deadlocked in the audio stop 3 s later, exited for a clean restart, and
+    the text existed only in memory: lost."""
+    try:
+        with open(PENDING_PATH, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "text": text}) + "\n")
+    except Exception as e:
+        log(f"pending: could not persist ({e})")
+
+
+def _pending_remove(text):
+    try:
+        if not PENDING_PATH.exists():
+            return
+        keep = [l for l in PENDING_PATH.read_text().splitlines() if l.strip() and json.loads(l).get("text") != text]
+        PENDING_PATH.write_text("\n".join(keep) + ("\n" if keep else ""))
+    except Exception as e:
+        log(f"pending: could not update ({e})")
+
+
+def _pending_replay():
+    """At start-up, queue whatever a previous daemon had accepted but not
+    delivered (older than 2 h is dropped, with a log line)."""
+    try:
+        if not PENDING_PATH.exists():
+            return
+        items = [json.loads(l) for l in PENDING_PATH.read_text().splitlines() if l.strip()]
+    except Exception as e:
+        log(f"pending: unreadable ({e})")
+        return
+    fresh = [it for it in items if time.time() - it.get("ts", 0) < 7200]
+    for it in items:
+        if it not in fresh:
+            log(f"pending: dropped stale item {it.get('text', '')[:60]!r}")
+    PENDING_PATH.write_text("".join(json.dumps(it) + "\n" for it in fresh))
+    for it in fresh:
+        _retry_q.append({"text": it["text"], "attempts": 0, "next_at": time.time() + 3.0, "why": "replayed after restart"})
+    if fresh:
+        log(f"pending: replaying {len(fresh)} undelivered item(s) from before the restart")
 _ax_probe_at = [0.0]
 
 
@@ -1193,6 +1260,7 @@ def _queue_retry(text, why):
             it["why"] = why
             if it["attempts"] >= RETRY_MAX:
                 _retry_q.remove(it)
+                _pending_remove(text)
                 log(f"inject: giving up after {RETRY_MAX} attempts ({why}): {text[:70]!r}")
                 _wa_notify("I could not deliver your last message to the Claude session for 15 minutes "
                            "(the app window was not reachable). Please open the Claude window and resend it.")
@@ -1281,6 +1349,9 @@ def launch_session(text=WAKE_PROMPT, _retry=False, home=True):
     """
     import urllib.parse as _up
 
+    if text != WAKE_PROMPT and not _retry:
+        _pending_add(text)
+
     # Saying the wake phrase is an explicit request to talk, so it clears any
     # pause exactly as the menu bar "Resume voice here" does. Without this the
     # session wakes but the agent immediately declines to start, which looks
@@ -1312,7 +1383,14 @@ def launch_session(text=WAKE_PROMPT, _retry=False, home=True):
         except Exception as _e:
             log(f"route: check failed ({_e})")
     ok, why = _native_paste(text)
-    if ok and text != WAKE_PROMPT:
+    # Inbox relays ("[inbox] ...") are background reads, not the user talking:
+    # they must never cut the agent's speech or its listen (the user's
+    # complaint: every new WhatsApp, Teams or mail message cut the agent off
+    # mid-sentence). They reach the agent at its next tool boundary anyway.
+    # "[call] ..." lines from call_watch.py (call started/ended, transcript
+    # ready) are the same kind of background notice.
+    relay = text.startswith("[inbox]") or text.startswith("[call]")
+    if ok and text != WAKE_PROMPT and not relay:
         _inject_at[0] = time.time()
         if _tts_playing[0] or VM_RECORDING_FLAG.exists():
             log("inject: agent is mid-step (speaking/listening) - skipping forward now")
@@ -1328,6 +1406,7 @@ def launch_session(text=WAKE_PROMPT, _retry=False, home=True):
                 DELIVERED_MARK.write_text(text[:200])
             except Exception:
                 pass
+            _pending_remove(text)
             for it in list(_retry_q):
                 if it["text"] == text:
                     _retry_q.remove(it)
@@ -1550,6 +1629,7 @@ def main():
 
     load_speaker_model()
     _start_verify_server()
+    _pending_replay()
 
     try:
         floor, ambient_p90 = calibrate(device)
@@ -1677,6 +1757,41 @@ def main():
                                 log(f"inject: session {target!r} not found; nothing typed")
                         except Exception as e:
                             log(f"inject: session command failed ({e})")
+                    elif _txt.startswith("@@axcopy"):
+                        # @@axcopy=<session path>;back=<session path>: press the last "Copy"
+                        # message action in that chat and save the clipboard to ax_copy.txt,
+                        # because the titles dump cannot carry a whole reply.
+                        try:
+                            _spec = _txt.split("=", 1)[1] if "=" in _txt else ""
+                            _sp = _spec.split(";back=")
+                            _path, _back = _sp[0].strip(), (_sp[1].strip() if len(_sp) > 1 else "")
+                            if _path:
+                                switch_session(_path)
+                                time.sleep(1.0)
+                            import ApplicationServices as AS
+                            from AppKit import NSRunningApplication, NSPasteboard
+                            _app = NSRunningApplication.runningApplicationsWithBundleIdentifier_(CLAUDE_BUNDLE)[0]
+                            _ax = AS.AXUIElementCreateApplication(_app.processIdentifier())
+                            AS.AXUIElementSetAttributeValue(_ax, "AXManualAccessibility", True)
+                            _win = _ax_attr(_ax, AS.kAXFocusedWindowAttribute)
+                            _q, _n, _btns = deque([_win]), 0, []
+                            while _q and _n < 8000:
+                                _el = _q.popleft(); _n += 1
+                                if (_ax_attr(_el, AS.kAXRoleAttribute) or "") == "AXButton" and (_ax_attr(_el, AS.kAXDescriptionAttribute) or "") == "Copy":
+                                    _btns.append(_el)
+                                for _k in (_ax_attr(_el, AS.kAXChildrenAttribute) or []):
+                                    _q.append(_k)
+                            _res = ""
+                            if _btns:
+                                _pb = NSPasteboard.generalPasteboard(); _pb.clearContents()
+                                _ax_press(_btns[-1]); time.sleep(0.8)
+                                _res = _pb.stringForType_("public.utf8-plain-text") or ""
+                            (INJECT_FILE.parent / "ax_copy.txt").write_text(_res)
+                            log(f"axcopy: {len(_btns)} copy buttons, {len(_res)} chars")
+                            if _back:
+                                switch_session(_back)
+                        except Exception as e:
+                            log(f"axcopy: failed ({e})")
                     elif _txt.startswith("@@axtitles"):
                         try:
                             _path = _txt.split("=", 1)[1] if "=" in _txt else ""
@@ -1763,6 +1878,9 @@ def main():
                     if time.time() - last_fire < COOLDOWN_S:
                         log("arm skipped: within cooldown")
                         continue
+                    if _call_active():
+                        log("arm skipped: call in progress (call_active.json)")
+                        continue
                     armed, armed_at, consec = True, time.time(), 0
                     ring.clear()
                     hits.clear()
@@ -1791,6 +1909,14 @@ def main():
                     armed = False
                     close_stream()
                     write_status("idle")
+
+            if armed and _call_active():
+                # A call began while we were listening over our own playback:
+                # give the mic up now rather than at TTS_PLAYBACK_END.
+                log("DISARMED (call in progress)")
+                armed = False
+                close_stream()
+                write_status("idle")
 
             if armed and stream is None:
                 try:
@@ -1926,7 +2052,8 @@ def main():
                     write_status("fired")
             elif (WAKE_ENABLED and not vm_recording
                   and not VM_RECORDING_FLAG.exists()
-                  and time.time() >= wake_hold_until):
+                  and time.time() >= wake_hold_until
+                  and not _call_active()):        # call_watch owns the mic during a call
                 # IDLE: listen for the wake phrase. Same stream discipline as
                 # barge-in - open only while we need it.
                 if stream is None:
@@ -2049,7 +2176,8 @@ def main():
             else:
                 if stream is not None and (vm_recording or not armed
                                            or VM_RECORDING_FLAG.exists()
-                                           or time.time() < wake_hold_until):
+                                           or time.time() < wake_hold_until
+                                           or _call_active()):
                     close_stream()
                 time.sleep(0.05)
     except KeyboardInterrupt:

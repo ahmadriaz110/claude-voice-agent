@@ -14,3 +14,13 @@ ecapa/
 enrolment*.wav
 tts_sample.wav
 daemon_capture.flag
+# call watch: recordings, live-call flag, the built helper binary
+calls/
+call_active.json
+callwatch/audiotap/audiotap
+# presence / quiet flags, mail signature template, pending-inject queue
+presence.json
+quiet.json
+templates/
+inject_pending.jsonl
+ttswatch.json
