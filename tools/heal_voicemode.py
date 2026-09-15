@@ -267,10 +267,77 @@ def restart_deaf_bargein() -> int:
     return 1
 
 
+KOKORO_URL = os.environ.get("HEAL_KOKORO_URL", "http://127.0.0.1:8880/v1/audio/speech")
+KOKORO_LABEL = "com.voicemode.kokoro"
+KOKORO_PROBE_VOICE = os.environ.get("HEAL_KOKORO_VOICE", "af_sky")
+TTS_MIN_BYTES = 1000
+TTS_STATE = Path.home() / ".voicemode" / "ttswatch.json"
+TTS_RESTART_COOLDOWN = 300.0
+
+
+def restart_mute_kokoro() -> int:
+    """Kokoro wedges in a state where it answers 200 with a ZERO-byte body:
+    the service looks healthy to launchd, every TTS call silently produces no
+    audio, and the agent simply goes quiet until someone asks why. Probe it
+    and restart when it is mute."""
+    import json as _json
+    import urllib.request as _u
+    body = _json.dumps({"model": "kokoro", "input": "health check",
+                        "voice": KOKORO_PROBE_VOICE, "response_format": "mp3"}).encode()
+    req = _u.Request(KOKORO_URL, data=body, method="POST",
+                     headers={"Content-Type": "application/json"})
+    try:
+        with _u.urlopen(req, timeout=30) as r:
+            n = len(r.read())
+            code = r.status
+    except Exception as e:
+        # not answering at all is launchd's problem, not a wedged-mute state
+        log(f"ttswatch: kokoro not reachable ({e}); leaving it to launchd")
+        return 0
+    if code == 200 and n >= TTS_MIN_BYTES:
+        return 0
+    # only restart if we have not just done so
+    try:
+        last = _json.loads(TTS_STATE.read_text()).get("last", 0)
+    except Exception:
+        last = 0
+    if time.time() - last < TTS_RESTART_COOLDOWN:
+        log(f"ttswatch: kokoro mute (http={code} bytes={n}) but restarted recently, waiting")
+        return 0
+    log(f"ttswatch: kokoro is MUTE (http={code} bytes={n}), restarting")
+    try:
+        subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{KOKORO_LABEL}"],
+                       check=True, timeout=30)
+    except Exception as e:
+        log(f"ttswatch: ERROR restarting kokoro: {e}")
+        return 1
+    try:
+        TTS_STATE.write_text(_json.dumps({"last": time.time()}))
+    except OSError:
+        pass
+    for _ in range(9):
+        time.sleep(10)
+        try:
+            with _u.urlopen(_u.Request(KOKORO_URL, data=body, method="POST",
+                                       headers={"Content-Type": "application/json"}), timeout=30) as r:
+                if r.status == 200 and len(r.read()) >= TTS_MIN_BYTES:
+                    log("ttswatch: kokoro restarted and producing audio again")
+                    return 0
+        except Exception:
+            continue
+    log("ttswatch: kokoro restarted but still not producing audio, needs a look")
+    return 1
+
+
 if __name__ == "__main__":
     if "--mic" in sys.argv:
-        sys.exit(restart_deaf_bargein())
+        # The two-minute launchd check: a deaf barge-in daemon and a mute Kokoro.
+        rc = restart_deaf_bargein()
+        sys.exit(max(rc, restart_mute_kokoro()))
+    if "--tts" in sys.argv:
+        sys.exit(restart_mute_kokoro())
     rc = heal()
     strip_kokoro_limit()
     rc = max(rc, restart_deaf_bargein())
+    rc = max(rc, restart_mute_kokoro())
     sys.exit(rc)

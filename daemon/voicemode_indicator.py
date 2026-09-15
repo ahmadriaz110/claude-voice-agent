@@ -42,6 +42,29 @@ import rumps
 EVENTS_DIR = Path.home() / ".voicemode" / "logs" / "events"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PREFS_PATH = Path.home() / ".voicemode" / "indicator" / "prefs.json"
+# Presence flag. One click in the menu says whether the user is at the desk.
+# The agent reads this before choosing a channel: at desk means speak, away
+# means write to the phone and stay quiet. The file is the whole contract:
+# {"at_desk": bool, "since": iso}. inbox_hooks.py watches it and injects a
+# "[presence]" line when it flips; tools/presence.py prints it for shell use.
+PRESENCE_PATH = Path.home() / ".voicemode" / "presence.json"
+
+
+def load_presence() -> bool:
+    try:
+        return bool(json.loads(PRESENCE_PATH.read_text()).get("at_desk", False))
+    except Exception:
+        return False
+
+
+def save_presence(at_desk: bool) -> None:
+    from datetime import datetime, timezone
+    try:
+        PRESENCE_PATH.write_text(json.dumps(
+            {"at_desk": at_desk, "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=2))
+    except OSError:
+        pass
+
 # Presence of this file tells the agent to stop looping at the end of the
 # current turn. The agent checks it between turns, so pause takes effect
 # after the turn in flight - it cannot interrupt one mid-sentence.
@@ -141,7 +164,7 @@ def app_new_session(prompt: str) -> None:
     """Open a NEW Claude Code tab in the desktop app, prompt pre-filled.
 
     Preferred over the Terminal route: the desktop app carries all the
-    connectors (Zoho, Deel, Outlook, computer-use, browser control) that a
+    connectors (accounting, HR, Outlook, computer-use, browser control) that a
     bare `claude` CLI session does not have.
 
     The prompt is pre-filled but NOT auto-sent - press Enter. There is no
@@ -388,7 +411,13 @@ class VoiceModeIndicator(rumps.App):
         # right-hand pane only lists running background jobs.
         self.tasks_menu = rumps.MenuItem("Tasks")
         self._tasks_stamp = 0.0
+        # Presence toggle at the very top: one click flips it, the title says
+        # which way it is. Starts from whatever the file says (Away if none).
+        self.presence_item = rumps.MenuItem("", callback=self.toggle_presence)
+        self._sync_presence_title()
         self.menu = [
+            self.presence_item,
+            None,
             self.state_item,
             self.last_item,
             self.health_item,
@@ -609,6 +638,18 @@ class VoiceModeIndicator(rumps.App):
             save_prefs(self.prefs)
             self._commit()
         return callback
+
+    def _sync_presence_title(self):
+        at = load_presence()
+        self.presence_item.title = "At desk  (click for Away)" if at else "Away  (click for At desk)"
+        self.presence_item.state = 1 if at else 0
+
+    def toggle_presence(self, _):
+        at = not load_presence()
+        save_presence(at)
+        self._sync_presence_title()
+        rumps.notification("VoiceMode", "At desk" if at else "Away",
+                           "Claude will talk to you here." if at else "Claude will message your phone instead.")
 
     def _set_thinking(self, enabled):
         def callback(_):
