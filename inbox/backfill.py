@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill the last N days of Outlook mail (Inbox + HCL) and Teams chat
+"""Backfill the last N days of Outlook mail (the INBOX_MAIL_FOLDERS) and Teams chat
 messages (the subscribed chats) into ~/.voicemode/context/history/*.jsonl,
 one record per message in the inbox.jsonl shape, flagged backfill=true.
 Never injects anything into the session. Usage: backfill.py [days]"""

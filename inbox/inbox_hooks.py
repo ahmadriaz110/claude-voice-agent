@@ -24,6 +24,7 @@ Usage:
   inbox_hooks.py --login    interactive device-code sign-in, then exit
   inbox_hooks.py --status   print health as JSON
 """
+import dns_fallback  # noqa: F401  DNS-over-HTTPS fallback when the system resolver dies
 import hashlib
 import hmac
 import json
@@ -55,14 +56,18 @@ PENDING = CTX / "pending_important.jsonl"
 DELIVERED = CTX / "delivered"          # touched by the daemon on a confirmed paste
 DELIVERY_WATCH_S = float(os.environ.get("INBOX_DELIVERY_WATCH_S", 90))
 INJECT_FILE = HOME / ".voicemode" / "indicator" / "inject.txt"
-# Escalation: if an important item is pushed into the session and he has not
-# responded within ESCALATE_AFTER_S, the same line is sent to his other
+# Escalation: if an important item is pushed into the session and the user has
+# not responded within ESCALATE_AFTER_S, the same line is sent to their other
 # WhatsApp number through the local Baileys daemon (POST /send). "Responded"
 # = ACK_FILE touched after the push: the barge-in daemon touches it whenever
-# it verifies his voice, and any reply from that number touches it too.
+# it verifies the user's voice, and any reply from that number touches it too.
 ACK_FILE = CTX / "ack"
 ESCALATE_TO = os.environ.get("INBOX_ESCALATE_TO", "")            # digits only, e.g. 4915551234567
-ESCALATE_AFTER_S = float(os.environ.get("INBOX_ESCALATE_AFTER", 20))
+# The user asked not to be notified for every message, only for urgent things
+# and things that need them to get completed. Chat items are handled by the
+# agent; only mail alerts, the sweep and Claude-not-running escalate on their
+# own, and only after a real wait.
+ESCALATE_AFTER_S = float(os.environ.get("INBOX_ESCALATE_AFTER", 300))
 ESCALATE_MIN_GAP_S = 120
 WA_DAEMON = os.environ.get("WA_DAEMON_URL", "http://127.0.0.1:47823")
 MEDIA_DIR = CTX / "media"
@@ -72,13 +77,53 @@ MEDIA_TYPES = {"imageMessage": "image", "audioMessage": "voice note", "videoMess
 _EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "audio/ogg": "ogg",
         "audio/mpeg": "mp3", "audio/mp4": "m4a", "video/mp4": "mp4", "application/pdf": "pdf"}
 _last_escalation = [0.0]
-# Unanswered client requests. New quote/clarification requests from HCL or
-# any client must not sit in the Inbox: if no reply from your own domain within
+# Unanswered client requests. New quote/clarification requests from any
+# client must not sit in the Inbox: if no reply from your own domain within
 # QUOTE_SLA_H hours, flag it as important (so it is spoken and escalated).
 QUOTE_SLA_H = float(os.environ.get("INBOX_QUOTE_SLA_H", 2))
 QUOTE_WORDS = ("quote", "quotation", "rfq", "request", "pricing", "price", "availability",
                "engineer", "support", "site visit", "schedule", "confirm", "urgent", "ticket",
                "resource", "onsite", "on-site", "estimate", "proposal")
+# Folders where every external mail counts as a client request (mail rules
+# move a client's traffic there), and domains that are clients, never vendors.
+CLIENT_FOLDERS = {f.strip() for f in os.environ.get("INBOX_CLIENT_FOLDERS", "").split(",") if f.strip()}
+CLIENT_DOMAINS = {d.strip().lower() for d in os.environ.get("INBOX_CLIENT_DOMAINS", "").split(",") if d.strip()}
+# Courtesy closings are not requests. "Thank you!", "Noted, will update the
+# customer", "Feedback is well received", "Thanks for the update" were all
+# flagged: a client folder counts every external mail, and elsewhere
+# QUOTE_WORDS matched the quoted thread under the one-liner. A mail whose own
+# words (see _own_text) are short and nothing but these phrases plus
+# connectives is a closing, not a request.
+COURTESY_WORDS = ("thank you", "thanks", "thx", "noted", "well received", "will update", "will revert",
+                  "will check", "will get back", "will do", "ok", "okay", "sure", "great", "perfect",
+                  "appreciated", "acknowledged", "understood", "received", "got it", "sounds good",
+                  "no problem", "welcome")
+COURTESY_MAX_CHARS = 120
+# Connectives allowed around a courtesy phrase ("thanks for the update",
+# "noted, will update the customer", "thank you in advance").
+_COURTESY_FILLER = {"a", "an", "the", "for", "your", "you", "in", "advance", "all", "much", "so", "very",
+                    "many", "and", "we", "i", "it", "this", "that", "is", "are", "of", "to", "on", "us",
+                    "me", "again", "too", "also", "shortly", "soon", "kind", "well", "with", "by", "as",
+                    "will", "be", "get", "back", "same", "then", "now", "regards", "lot"}
+# Vendor / partner offers wait on OUR decision and carry no reply SLA: a
+# supplier mailing a candidate profile and a monthly rate, a partner sending a
+# rate card. List their domains in INBOX_VENDOR_DOMAINS. Mail from a client
+# domain (INBOX_CLIENT_DOMAINS) is never a vendor mail, whatever it says about
+# candidates.
+VENDOR_DOMAINS = {d.strip().lower() for d in os.environ.get("INBOX_VENDOR_DOMAINS", "").split(",") if d.strip()}
+# "per month", "candidate" and bare "resume" are deliberately not here: a
+# client can write "your rate per month" or "we can resume the migration", so
+# only phrases that mean an offer from a supplier stay. Extend with
+# INBOX_VENDOR_WORDS (comma-separated, lower-case).
+VENDOR_WORDS = ("profile attached", "please find the attached profile", "attached profile",
+                "our rate", "rate card", "cv attached", "resume attached", "candidate profile") + tuple(
+    w.strip().lower() for w in os.environ.get("INBOX_VENDOR_WORDS", "").split(",") if w.strip())
+# Senders that are systems, not people (prefix match on the address), and
+# phrases that mark a portal notice (a pre-billing upload confirmation, a
+# referral notice) as system mail rather than a request to us.
+SYSTEM_SENDERS = tuple(s.strip().lower() for s in os.environ.get(
+    "INBOX_SYSTEM_SENDERS", "no-reply@,noreply@,mailer-daemon,donotreply@").split(",") if s.strip())
+SYSTEM_PHRASES = tuple(p.strip().lower() for p in os.environ.get("INBOX_SYSTEM_PHRASES", "").split(",") if p.strip())
 SWEPT_FILE = CTX / "escalated_requests.json"
 _sweep_count = [0]
 # One subscription pass at a time, and lifecycle events renew ONE subscription
@@ -90,8 +135,22 @@ _pass_requested = [False]
 _throttled_until = [0.0]
 
 PORT = int(os.environ.get("INBOX_PORT", 8898))
-ME_EMAIL = os.environ.get("INBOX_ME_EMAIL", "")          # your mailbox address
-ME_NAMES = ("ahmad", "riaz")
+ME_EMAIL = os.environ.get("INBOX_ME_EMAIL", "").lower()          # your mailbox address
+# Lower-case parts of your name; a display name or address containing ALL of
+# them is you ("jane,doe").
+ME_NAMES = tuple(n.strip().lower() for n in os.environ.get("INBOX_ME_NAMES", "").split(",") if n.strip())
+# Your WhatsApp contact name(s) as seen from your own account, lower-case,
+# comma-separated: a 1:1 message whose author is one of these came from your
+# other phone.
+ME_WA_NAMES = {n.strip().lower() for n in os.environ.get("INBOX_ME_WA_NAMES", "").split(",") if n.strip()}
+# Extra phrases in a group that mean you were addressed ("jane doe,jane ji"),
+# lower-case, comma-separated. "@<first name>" is always one.
+ME_ALIASES = tuple(a.strip().lower() for a in os.environ.get("INBOX_ME_ALIASES", "").split(",") if a.strip())
+ME_ID = os.environ.get("INBOX_ME_ID", "")                          # Entra user id, for Teams mentions
+# Our own WhatsApp ids as they appear in @mentions (lid and/or phone digits).
+# Without them, someone tagging a third person came through as "you were
+# mentioned" because any mention matched.
+ME_WA_IDS = {x.strip() for x in os.environ.get("INBOX_ME_WA_IDS", "").split(",") if x.strip()}
 OWN_DOMAIN = os.environ.get("INBOX_OWN_DOMAIN", ME_EMAIL.split("@")[-1])
 # Microsoft Graph Command Line Tools: a first-party public client that
 # supports device-code sign-in with delegated Graph scopes, so no app
@@ -228,10 +287,10 @@ CHAT_MAX = int(os.environ.get("INBOX_CHAT_MAX", 90))
 CATCHUP_S = int(os.environ.get("INBOX_CATCHUP_S", 120))
 CHAT_REFRESH_S = int(os.environ.get("INBOX_CHAT_REFRESH_S", 600))
 CATCHUP_FILE = CTX / "catchup_state.json"
-# Mail folders to watch. Rules move client mail (e.g. HCL) out of the Inbox,
-# so a subscription on the Inbox alone misses it. Names are resolved to ids
-# at the top level and one level under the Inbox.
-MAIL_FOLDERS = [f.strip() for f in os.environ.get("INBOX_MAIL_FOLDERS", "Inbox,HCL").split(",") if f.strip()]
+# Mail folders to watch. Rules move client mail (a per-client folder) out of
+# the Inbox, so a subscription on the Inbox alone misses it. Names are
+# resolved to ids at the top level and one level under the Inbox.
+MAIL_FOLDERS = [f.strip() for f in os.environ.get("INBOX_MAIL_FOLDERS", "Inbox,Clients").split(",") if f.strip()]
 _mail_res_at = 0.0
 _mail_res = []
 
@@ -325,6 +384,7 @@ def catchup_new_chats(allc):
                     "chat": info["topic"], "chat_type": info["type"], "chat_id": chat_id,
                     "text": _strip_html((m.get("body") or {}).get("content", ""))[:400],
                     "mentions": [x.get("mentionText", "") for x in m.get("mentions", [])],
+                    "mention_ids": [((x.get("mentioned") or {}).get("user") or {}).get("id", "") for x in m.get("mentions", [])],
                     "catchup": True})
             n_msgs += 1
     CATCHUP_FILE.write_text(json.dumps({"since": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}))
@@ -459,14 +519,106 @@ def _ensure_subscriptions_inner():
     _state["subs"]["chats"] = sum(1 for k in subs if k.startswith("chat:"))
 
 
+# Where the quoted thread starts in a bodyPreview: Outlook "From:/Sent:" (and
+# the ________ rule above them), French "De :/Envoyé :", German "Von:/Gesendet:",
+# "-----Original Message-----", "On ... wrote:", "Le ... a écrit :", "> " quotes.
+# A corporate "Classification: Internal" line comes BEFORE the real text and is
+# dropped separately, never cut on.
+_QUOTED_RE = re.compile(r"^[ \t]*(?:(?:from|sent|de|envoy\u00e9|von|gesendet)[ \t]?:|-{2,}[ \t]*(?:original|forwarded|urspr\u00fcngliche)"
+                        r"|_{5,}[ \t]*$|>|on\b[^\n]{0,160}(?:\n[^\n]{0,120})?\bwrote:|le\b[^\n]{0,160}\ba \u00e9crit[ \t]*:)",
+                        re.I | re.M)
+# A signature starts at a regards-family phrase ("Thanks & Regards", "Best
+# regards,", "Regards, Jane", "Cordialement"), a phone-mail footer, or the
+# sender's own name on a line (a "Thank you!" followed by a bare name had no
+# regards line at all). "with regards to the ticket" is not a sign-off.
+_SIGNOFF_RE = re.compile(r"(?:^|[\s,.!])(?:(?:many|best|kind|warm)\s+)?(?:thanks?\s*(?:&|and)?\s*|thank you\s*(?:&|and)?\s*)?"
+                         r"(?:regards|rgds)\b(?!\s+(?:to|the)\b)"
+                         r"|(?:^|\n)[ \t]*(?:(?:best|cheers|sincerely|yours (?:sincerely|faithfully)|cordialement|bien (?:\u00e0|a) vous"
+                         r"|(?:mit )?freundlichen? gr(?:\u00fc|ue)(?:\u00df|ss)en?|mfg|viele gr(?:\u00fc|ue)(?:\u00df|ss)e)"
+                         r"(?:[ \t]*(?:\n|$)|[,.!][^\n]{0,30}(?:\n|$))"
+                         r"|(?:sent from my|get outlook for|please excuse any typo)\b)", re.I)
+_GREETING_RE = re.compile(r"^(?:hi|hello|hey|dear|good (?:morning|afternoon|evening)|bonjour|hallo|salam)\b[^,\n]{0,40}[,:!.]?\s*", re.I)
+_PLEASANTRY_RE = re.compile(r"(?:i\s+)?(?:hope|trust)\s+(?:you\s+are|you're|this\s+(?:e-?mail|message)\s+finds\s+you)\s+(?:all\s+)?(?:doing\s+)?(?:well|fine|good|great)[\s.!,]*", re.I)
+_GENERIC_NAMES = {"team", "all", "sir", "madam", "everyone", "both", "colleagues", "there", "mr", "mrs", "ms", "miss", "dr"}
+_COURTESY_RE = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in sorted(COURTESY_WORDS, key=len, reverse=True)) + r")\b[.!,]*")
+_ASK_RE = re.compile(r"\b(?:please|pls|kindly|could you|can you|would you|let (?:me|us) know)\b")
+_VENDOR_RE = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in VENDOR_WORDS) + r")\b")
+
+
+def _name_tokens(addrs):
+    """Lower-case word tokens of the display names and address local parts of
+    a list of Graph emailAddress dicts ("Doe, Jane" -> {doe, jane})."""
+    out = set()
+    for a in addrs:
+        out |= set(re.findall(r"[a-z]+", ((a or {}).get("name") or "").lower()))
+        out |= set(re.findall(r"[a-z]+", ((a or {}).get("address") or "").lower().split("@")[0]))
+    return out
+
+
+def _is_name_line(line, names):
+    toks = re.findall(r"[a-z]+", line.lower())
+    return bool(toks) and len(toks) <= 5 and any(t in names for t in toks) and all(t in names or t in _GENERIC_NAMES for t in toks)
+
+
+def _own_text(m):
+    """The sender's own words in a message: bodyPreview minus the outside-mail
+    banner, the "Classification:" line, everything from the first quoted-header
+    marker, the greeting / recipient name line, and the signature (a sign-off
+    phrase or the sender's name line, and all below). Lower-case, one line."""
+    t = (m.get("bodyPreview") or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\[\s*(?:caution|external|warning)\b[^\]]*\]?", " ", t, flags=re.I)
+    t = re.sub(r"^[ \t]*(?:caution|classification)\s*:[^\n]*\n?", "", t, flags=re.I | re.M)
+    for rx in (_QUOTED_RE, _SIGNOFF_RE):
+        hit = rx.search(t)
+        if hit:
+            t = t[:hit.start()]
+    t = _PLEASANTRY_RE.sub(" ", _GREETING_RE.sub("", t.strip()))
+    lines = [l.strip() for l in t.split("\n") if l.strip()]
+    hello = _name_tokens([(r.get("emailAddress") or {}) for r in (m.get("toRecipients") or [])])
+    if lines and _is_name_line(lines[0], hello):
+        lines = lines[1:]
+    sender = _name_tokens([(m.get("from") or {}).get("emailAddress") or {}])
+    for i, l in enumerate(lines):
+        if _is_name_line(l, sender):
+            lines = lines[:i]; break
+    return re.sub(r"\s+", " ", " ".join(lines)).strip().lower()
+
+
+def _is_courtesy(own):
+    """True when the sender's own words are a short closing: nothing left but
+    COURTESY_WORDS and connectives (at most two other words), no question and
+    no please/kindly ("Noted, please also send the CMR" is still a request)."""
+    if not own or len(own) > COURTESY_MAX_CHARS or "?" in own or _ASK_RE.search(own):
+        return False
+    rest = _COURTESY_RE.sub(" ", own)
+    if rest == own:
+        return False
+    return len([w for w in re.findall(r"[a-z0-9']+", rest) if w not in _COURTESY_FILLER]) <= 2
+
+
 def _is_request(m, folder):
     frm = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
-    if not frm or frm.endswith("@" + OWN_DOMAIN) or frm.startswith(("no-reply@", "noreply@", "mailer-daemon")):
+    if not frm or frm.endswith("@" + OWN_DOMAIN) or frm.startswith(SYSTEM_SENDERS):
         return False
     blob = ((m.get("subject") or "") + " " + (m.get("bodyPreview") or "")).lower()
     if "automatic reply" in blob or "out of office" in blob:
         return False
-    return folder == "HCL" or any(w in blob for w in QUOTE_WORDS)
+    # Portal notices addressed to a client's own approver (pre-billing uploads,
+    # referrals) are system mail, not a request to us: INBOX_SYSTEM_PHRASES.
+    if any(p in blob for p in SYSTEM_PHRASES):
+        return False
+    # Vendor / partner offers (profiles, rates) are ours to decide on, not
+    # client requests: see VENDOR_DOMAINS / VENDOR_WORDS.
+    if frm.rsplit("@", 1)[-1] in VENDOR_DOMAINS:
+        return False
+    own = _own_text(m)
+    if not any(frm.endswith("@" + d) for d in CLIENT_DOMAINS) and _VENDOR_RE.search(own):
+        return False
+    # Courtesy closings ("Thank you!", "Noted, will update") are not requests,
+    # whatever the quoted thread below them says.
+    if _is_courtesy(own):
+        return False
+    return folder in CLIENT_FOLDERS or any(w in blob for w in QUOTE_WORDS)
 
 
 def sweep_unanswered_requests():
@@ -501,7 +653,7 @@ def sweep_unanswered_requests():
             # Only messages in this conversation sent AFTER the request, and follow
             # paging: a long-running ticket thread has 70+ messages and an unordered
             # $top=50 returned the oldest ones, hiding a reply sent 8 minutes after
-            # the request (Mahesh / TRM2026TN099, 2026-09-06).
+            # the request.
             try:
                 flt = urllib.parse.quote(f"conversationId eq '{conv}' and sentDateTime ge {m['receivedDateTime']}")
                 url_t = f"me/messages?$filter={flt}&$select=from,sentDateTime,receivedDateTime&$top=50"
@@ -514,6 +666,30 @@ def sweep_unanswered_requests():
                 log(f"sweep: thread lookup failed: {str(e)[:100]}"); continue
             answered = any((((t.get("from") or {}).get("emailAddress") or {}).get("address", "").lower().endswith("@" + OWN_DOMAIN))
                            and (t.get("sentDateTime") or t.get("receivedDateTime") or "") > m["receivedDateTime"] for t in thread)
+            if not answered:
+                # Answered on a sibling thread: a client's forward (its own
+                # conversationId) was answered 2 minutes later on the original
+                # thread and still flagged. Anything we sent to that sender
+                # within QUOTE_SLA_H of the request counts as the answer.
+                sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+                until = (rcv + timedelta(hours=QUOTE_SLA_H)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                try:
+                    flt = urllib.parse.quote(f"sentDateTime ge {m['receivedDateTime']}")
+                    url_s = f"me/mailFolders/sentitems/messages?$filter={flt}&$select=toRecipients,ccRecipients,sentDateTime,subject&$top=50"
+                    sent = []
+                    while url_s:
+                        page = graph("GET", url_s)
+                        sent += page.get("value", [])
+                        url_s = page.get("@odata.nextLink")
+                except Exception as e:
+                    log(f"sweep: sent items lookup failed: {str(e)[:100]}"); continue
+                for s in sent:
+                    rcpts = [((r.get("emailAddress") or {}).get("address") or "").lower()
+                             for r in (s.get("toRecipients") or []) + (s.get("ccRecipients") or [])]
+                    if sender in rcpts and m["receivedDateTime"] < (s.get("sentDateTime") or "") <= until:
+                        log(f"sweep: {folder} {(m.get('subject') or '')[:60]!r} from {sender} answered on another thread "
+                            f"({(s.get('subject') or '')[:60]!r} at {s.get('sentDateTime')})")
+                        answered = True; break
             if answered:
                 continue
             frm = (m.get("from") or {}).get("emailAddress") or {}
@@ -576,9 +752,194 @@ def _strip_html(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+_own_posts = {}          # chat jid -> time of our last message there
+# A tag can sit in the line, come before the message, or come after it.
+# Remember who tagged us where, and treat that sender's
+# messages in the same chat for MENTION_AFTER_S as part of the request; on a
+# tag, also pull that sender's messages from the previous MENTION_BEFORE_S.
+_mentioned_by = {}       # (chat key, sender) -> time of their last tag of us
+MENTION_AFTER_S = float(os.environ.get("INBOX_MENTION_AFTER_S", 10 * 60))
+MENTION_BEFORE_S = float(os.environ.get("INBOX_MENTION_BEFORE_S", 3 * 60))
+
+
+def _recent_from_sender(chat_key, sender, seconds):
+    """Texts this sender posted in this chat within the last `seconds`, oldest
+    first, from the digest (the message-then-tag case)."""
+    out = []
+    try:
+        cutoff = time.time() - seconds
+        for l in open(INBOX):
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            if (r.get("from") or "") != sender:
+                continue
+            if (r.get("chat_jid") or r.get("chat_id") or r.get("chat") or "") != chat_key:
+                continue
+            try:
+                ts = datetime.fromisoformat(str(r.get("ts", "")).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            if ts >= cutoff and (r.get("text") or "").strip() and not r.get("from_me"):
+                out.append((r.get("text") or "").strip())
+    except Exception:
+        pass
+    return out[-6:]
+
+
+# Presence flag written by the menu-bar indicator: {"at_desk": bool, "since": iso}.
+PRESENCE_PATH = Path.home() / ".voicemode" / "presence.json"
+_presence_state = {"at_desk": None}
+
+
+def _presence_watch():
+    """Tell the agent when the user flips the menu-bar At desk / Away toggle.
+
+    The menu bar writes presence.json silently, so the agent only learned of a
+    change if it happened to read the file; the user came back to the desk and
+    the agent kept reporting to their phone. Now a change is injected like any
+    other event."""
+    while True:
+        try:
+            cur = json.loads(PRESENCE_PATH.read_text()).get("at_desk")
+        except Exception:
+            cur = None
+        if cur is not None and _presence_state["at_desk"] is not None and cur != _presence_state["at_desk"]:
+            where = "AT DESK" if cur else "AWAY"
+            how = ("reply in the session chat, the user is at the desk"
+                   if cur else ("reply on WhatsApp +" + ESCALATE_TO if ESCALATE_TO else "hold non-urgent items")
+                   + ", the user is away")
+            _inject_buf.append((f"[presence] The user is now {where}: {how}.", False))
+            _inject_later()
+            log(f"presence: changed to {where}")
+        if cur is not None:
+            _presence_state["at_desk"] = cur
+        time.sleep(20)
+
+
+AGENT_SENT_IDS = Path.home() / ".voicemode" / "agent_sent_ids.jsonl"
+
+
+def mark_agent_sent(message_id, chat="", text=""):
+    """Record what the AGENT sent. The user and the agent post from the same
+    account, so fromMe alone cannot tell them apart; without this the agent
+    reads its own messages back as if the user had written them. The bridge
+    returns no message id, so the exact text is the key."""
+    if not (message_id or text):
+        return
+    try:
+        with open(AGENT_SENT_IDS, "a") as f:
+            f.write(json.dumps({"id": message_id, "chat": chat,
+                                "text": (text or "")[:400],
+                                "ts": datetime.now(timezone.utc).isoformat()}) + "\n")
+    except OSError:
+        pass
+
+
+def _agent_sent_keys():
+    """(ids, normalised texts) the agent sent in the last 24 h."""
+    ids, texts = set(), set()
+    cutoff = time.time() - 24 * 3600
+    try:
+        for l in open(AGENT_SENT_IDS):
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(str(r.get("ts", "")).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = cutoff
+            if ts < cutoff:
+                continue
+            if r.get("id"):
+                ids.add(r["id"])
+            t = " ".join((r.get("text") or "").split())[:160]
+            if t:
+                texts.add(t)
+    except OSError:
+        pass
+    return ids, texts
+
+
+OWN_POST_WINDOW_S = float(os.environ.get("INBOX_OWN_POST_WINDOW_S", 24 * 3600))
+
+
+def _seed_own_posts():
+    """The thread-reply rule lived only in memory and a restart emptied it, so
+    an engineer's reply 2 h after our post was filed as chatter.
+    Seed from the digest: every message from our side in the last day."""
+    try:
+        cutoff = time.time() - OWN_POST_WINDOW_S
+        for l in open(INBOX):
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            if r.get("from_me") or _is_me(r.get("from", "")):
+                try:
+                    ts = datetime.fromisoformat(str(r.get("ts", "")).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                if ts >= cutoff:
+                    key = r.get("chat_jid") or r.get("chat_id") or r.get("chat") or ""
+                    _own_posts[key] = max(_own_posts.get(key, 0), ts)
+        log(f"own-posts seeded: {len(_own_posts)} thread(s) from the last {OWN_POST_WINDOW_S/3600:.0f} h")
+    except Exception as e:
+        log(f"own-posts seed failed ({e})")
+
+
+def _own_post_recent(jid):
+    """Ask the bridge whether we posted in this chat within the window. The
+    digest holds only inbound traffic, so bridge-sent posts (two questions the
+    agent asked an engineer one evening) were invisible to the seed and his
+    reply the next morning was filed as chatter."""
+    if not jid:
+        return 0
+    try:
+        import urllib.parse as _up
+        with urllib.request.urlopen(f"{WA_DAEMON}/messages?phone={_up.quote(jid)}&limit=40", timeout=5) as r:
+            msgs = json.load(r)
+        cutoff = time.time() - OWN_POST_WINDOW_S
+        best = 0
+        for m in msgs or []:
+            if m.get("from") != "me":
+                continue
+            try:
+                ts = datetime.fromisoformat(str(m.get("timestamp", "")).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            if ts >= cutoff:
+                best = max(best, ts)
+        if best:
+            _own_posts[jid] = max(_own_posts.get(jid, 0), best)
+        return best
+    except Exception as e:
+        log(f"own-post bridge check failed for {jid}: {e}")
+        return 0
+
+
 def _is_me(name_or_email):
     v = (name_or_email or "").lower()
-    return ME_EMAIL in v or all(n in v for n in ME_NAMES)
+    return bool(v) and ((bool(ME_EMAIL) and ME_EMAIL in v) or (bool(ME_NAMES) and all(n in v for n in ME_NAMES)))
+
+
+def _mention_regexes():
+    """Text patterns that mean you were tagged. Teams: "@first last" only (a
+    bare "@first" matched someone else's split mention "@Other @First" and
+    raised a false "you were mentioned"; the mentioned user id is used first).
+    WhatsApp groups: "@first", plus every phrase in INBOX_ME_ALIASES."""
+    teams = wa = None
+    if ME_NAMES:
+        teams = re.compile("@" + r"\s*@?\s*".join(re.escape(n) for n in ME_NAMES) + r"\b", re.I)
+        pats = ["@" + re.escape(ME_NAMES[0]) + r"\b"]
+        pats += [r"\b" + re.escape(a) + r"\b" for a in ME_ALIASES]
+        wa = re.compile("|".join(pats), re.I)
+    return teams, wa
+
+
+_ME_TEAMS_RE, _ME_WA_RE = _mention_regexes()
 
 
 def fetch_mail(resource):
@@ -614,11 +975,12 @@ def fetch_chat(resource):
     chat_id = m.get("chatId") or resource.split("/")[1]
     info = _chat_topic(chat_id)
     mentions = [x.get("mentionText", "") for x in m.get("mentions", [])]
+    mention_ids = [((x.get("mentioned") or {}).get("user") or {}).get("id", "") for x in m.get("mentions", [])]
     return {"channel": "teams", "id": m.get("id"), "ts": m.get("createdDateTime"),
             "from": frm.get("displayName", ""), "from_name": frm.get("displayName", ""),
             "chat": info["topic"], "chat_type": info["type"], "chat_id": chat_id,
             "text": _strip_html((m.get("body") or {}).get("content", ""))[:400],
-            "mentions": mentions}
+            "mentions": mentions, "mention_ids": mention_ids}
 
 
 def normalise_whatsapp(evt):
@@ -633,8 +995,8 @@ def normalise_whatsapp(evt):
                 "documentMessage": "[document]", "stickerMessage": "[sticker]"}.get(mtype, f"[{mtype}]")
     author = d.get("author") or ""
     from_me = bool(d.get("fromMe")) or author == "me"
-    other = (jid.startswith(ESCALATE_TO) or (not from_me and not d.get("isGroup")
-             and author.strip().lower() in ("ahmad riaz", "ahmad", "ahmad riaz (other)")))
+    other = ((bool(ESCALATE_TO) and jid.startswith(ESCALATE_TO)) or (not from_me and not d.get("isGroup")
+             and author.strip().lower() in ME_WA_NAMES))
     return {"channel": "whatsapp", "id": d.get("messageId"), "from_other_phone": other,
             "ts": d.get("timestamp") or datetime.now(timezone.utc).isoformat(),
             "from": author if not from_me else "me", "from_me": from_me,
@@ -653,7 +1015,7 @@ def is_important(item):
         if frm.startswith("no-reply@") or frm.startswith("noreply@") or "automatic reply" in item.get("subject", "").lower():
             return False, "automated"
         if _is_me(frm):
-            return False, "own"
+            return False, "own (sent by you)"
         direct = any(ME_EMAIL in a.lower() for a in item.get("to", []) + item.get("cc", []))
         subj = (item.get("subject") or "").lower()
         hot = any(w in subj or w in text for w in IMPORTANT_WORDS)
@@ -664,15 +1026,49 @@ def is_important(item):
             return True, "addressed to you" + (", external" if external else "") + (", keyword" if hot else "")
         return False, "not addressed / routine"
     if ch == "teams":
+        # Sender-less, text-less events (call started, member added) are Teams
+        # system messages; one from a group chat was injected once.
+        if not (item.get("from") or "").strip() and not (text or "").strip():
+            return False, "system event"
         if _is_me(item.get("from", "")):
+            _own_posts[item.get("chat_id") or item.get("chat") or ""] = time.time()
             return False, "own"
+        _lastt = _own_posts.get(item.get("chat_id") or item.get("chat") or "", 0)
+        if _lastt and time.time() - _lastt < OWN_POST_WINDOW_S and item.get("chat_type") != "oneOnOne":
+            return True, "reply in a thread you posted in"
         if item.get("chat_type") == "oneOnOne":
             return True, "direct message"
-        if any(_is_me(m) for m in item.get("mentions", [])) or "@ahmad" in text:
+        # Use the mentioned user id when Graph gives it; otherwise require the
+        # full name (see _mention_regexes for why a bare first name is not enough).
+        _flat = re.sub(r"(&nbsp;|\s)+", " ", text)
+        _ck = item.get("chat_id") or item.get("chat") or ""
+        _snd = item.get("from") or ""
+        if (ME_ID and ME_ID in item.get("mention_ids", [])) or any(_is_me(m) for m in item.get("mentions", [])) \
+                or (_ME_TEAMS_RE is not None and _ME_TEAMS_RE.search(_flat)):
+            _mentioned_by[(_ck, _snd)] = time.time()
+            _prev = [t for t in _recent_from_sender(_ck, _snd, MENTION_BEFORE_S) if t != text.strip()]
+            if _prev:
+                item["text"] = "(sent just before the tag) " + " | ".join(_prev) + " || " + text
             return True, "you were mentioned"
+        _lm = _mentioned_by.get((_ck, _snd), 0)
+        if _lm and time.time() - _lm < MENTION_AFTER_S:
+            return True, "follow-up to their tag of you"
         return False, "group chatter"
     if ch == "whatsapp":
-        if re.match(r"^\[(senderKeyDistributionMessage|protocolMessage|reactionMessage|ephemeralMessage)\]$", text.strip()):
+        # Status (story) broadcasts are not messages to us; a contact's status
+        # video was injected as a "direct message" once.
+        _cj = str(item.get("chat_jid") or "")
+        _c = str(item.get("chat") or "")
+        # Status jids come in two shapes: "status@broadcast" and the newer
+        # "<lid>@lid.status" (relayed as a bare "?" from a status reply).
+        # Neither is a message addressed to us.
+        if (_cj.startswith("status@") or _cj.endswith("@lid.status")
+                or _cj.endswith(".status") or _c in ("status", "status@broadcast")):
+            return False, "status broadcast"
+        # Any bare bracketed camel-case token is a WhatsApp protocol placeholder
+        # ([protocolMessage], [messageContextInfo], [senderKeyDistributionMessage]...),
+        # never a message. Real placeholders carry spaces or a path.
+        if re.match(r"^\[[a-z]+[A-Za-z]*\]$", text.strip()) and not re.match(r"^\[(voice note|image|video|document|sticker|media)", text.strip(), re.I):
             return False, "protocol noise"
         if item.get("from_other_phone") and not item.get("from_me"):
             item["from"] = "the user (other phone)"
@@ -682,11 +1078,35 @@ def is_important(item):
                 pass
             return True, "your instruction via WhatsApp"
         if item.get("from_me"):
-            return False, "own"
+            _own_posts[item.get("chat_jid") or item.get("chat") or ""] = time.time()
+            _aids, _atexts = _agent_sent_keys()
+            _norm = " ".join((item.get("text") or "").split())[:160]
+            if item.get("id") in _aids or (_norm and _norm in _atexts):
+                item["sent_by"] = "agent"
+                return False, "own (sent by the agent)"
+            item["sent_by"] = "user"
+            return False, "own (sent by you)"
         if not item.get("group"):
             return True, "direct message"
-        if any(m and m in text for m in item.get("mentions", [])) or "ahmad" in text:
+        # A reply in a group where our side posted within the window is part
+        # of a thread we opened (an engineer's answer sat unseen as "chatter"
+        # after the agent asked him a question there).
+        _jid = item.get("chat_jid") or item.get("chat") or ""
+        _last = _own_posts.get(_jid, 0) or _own_post_recent(_jid)
+        if _last and time.time() - _last < OWN_POST_WINDOW_S:
+            return True, "reply in a thread you posted in"
+        _ment = [m for m in item.get("mentions", []) if m]
+        _low = text.lower()
+        _snd = item.get("from") or ""
+        if any(m in ME_WA_IDS for m in _ment) or (_ME_WA_RE is not None and _ME_WA_RE.search(_low)):
+            _mentioned_by[(_jid, _snd)] = time.time()
+            _prev = [t for t in _recent_from_sender(_jid, _snd, MENTION_BEFORE_S) if t != text.strip()]
+            if _prev:
+                item["text"] = "(sent just before the tag) " + " | ".join(_prev) + " || " + text
             return True, "you were mentioned"
+        _lm = _mentioned_by.get((_jid, _snd), 0)
+        if _lm and time.time() - _lm < MENTION_AFTER_S:
+            return True, "follow-up to their tag of you"
         return False, "group chatter"
     return False, "unknown"
 
@@ -701,7 +1121,12 @@ def _wa_send(phone, message):
     req = urllib.request.Request(WA_DAEMON + "/send", data=data, method="POST",
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=15) as r:
-        return r.read().decode()[:120]
+        body = r.read().decode()
+    try:
+        mark_agent_sent((json.loads(body) or {}).get("id"), phone, message)
+    except Exception:
+        pass
+    return body[:120]
 
 
 def _escalate_if_unacked(t0, text, force=False):
@@ -742,9 +1167,24 @@ def _check_delivered(t0, text):
         log(f"delivery watch: notify failed: {e}")
 
 
+# Quiet mode ("do this digest in the background"): when
+# ~/.voicemode/quiet.json exists, nothing is injected into the Claude session
+# and nothing is escalated. Everything still lands in the digest and the log,
+# so the agent reads it on demand. Delete the file to turn injection back on.
+QUIET_FLAG = Path.home() / ".voicemode" / "quiet.json"
+
+
+def _quiet() -> bool:
+    return QUIET_FLAG.exists()
+
+
 def _flush_inject():
     global _last_inject, _inject_buf
     if not _inject_buf:
+        return
+    if _quiet():
+        n = len(_inject_buf); _inject_buf = []
+        log(f"inject: quiet mode, {n} item(s) logged only")
         return
     items = _inject_buf; _inject_buf = []
     lines = [l for l, _ in items]
@@ -790,9 +1230,10 @@ def _summary_line(item, why):
 
 
 def _whisper(path, mime, language=None):
-    """Transcribe. Whisper labels his Urdu as Hindi (Devanagari) or Punjabi
-    (Gurmukhi); he speaks English, Urdu and Punjabi and wants Urdu script,
-    never Hindi. So detect first, and re-run forced to Urdu on hi/pa."""
+    """Transcribe. Whisper labels the user's Urdu as Hindi (Devanagari) or
+    Punjabi (Gurmukhi); the user speaks English, Urdu and Punjabi and wants
+    Urdu script, never Hindi. So detect first, and re-run forced to Urdu on
+    hi/pa."""
     data = path.read_bytes()
     b = "----inboxwhisper"
     lang = f"--{b}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{language}\r\n" if language else ""
@@ -849,6 +1290,43 @@ def _enrich_whatsapp_media(item):
         log(f"whatsapp media: fetch failed for {item.get('id')}: {e}")
 
 
+READ_GRACE_S = float(os.environ.get("INBOX_READ_GRACE_S", 75))
+
+
+def _user_has_read(item):
+    """Has the user already read this message themselves? Teams: the chat
+    viewpoint's last-read time is at or after the message. WhatsApp: the bridge
+    reports the chat's unread count as zero. The rule: a message the user has
+    read is not acted on or relayed."""
+    try:
+        if item.get("channel") == "teams" and item.get("chat_id"):
+            c = graph("GET", f"chats/{item['chat_id']}?$select=id,viewpoint")
+            last = ((c or {}).get("viewpoint") or {}).get("lastMessageReadDateTime") or ""
+            return bool(last) and last >= (item.get("ts") or "")
+        if item.get("channel") == "whatsapp":
+            jid = item.get("chat_jid") or ""
+            with urllib.request.urlopen(WA_DAEMON + "/chats?limit=400", timeout=10) as r:
+                d = json.loads(r.read().decode())
+            chats = d.get("chats", d) if isinstance(d, dict) else d
+            for c in chats:
+                if c.get("id") == jid:
+                    return int(c.get("unreadCount") or 0) == 0
+    except Exception as e:
+        log(f"read-check failed ({e}); treating as unread")
+    return False
+
+
+def _queue_after_read_check(item, why, auto):
+    global _inject_buf
+    time.sleep(READ_GRACE_S)
+    if _user_has_read(item):
+        log(f"{item['channel']}: read by the user within {READ_GRACE_S:.0f}s; not injected ({why})")
+        return
+    with _lock:
+        _inject_buf.append((_summary_line(item, why), auto))
+        _inject_later()
+
+
 def record(item):
     if item.get("channel") == "whatsapp" and not item.get("from_me"):
         _enrich_whatsapp_media(item)
@@ -869,12 +1347,17 @@ def record(item):
         _state["last_event"] = item["received"]
         if important:
             # Mentions and direct messages on Teams/WhatsApp: the agent replies as
-            # the user and asks what is needed first (his rule, 2026-09-06). Mail
-            # alerts and the unanswered-request sweep still escalate automatically.
+            # the user and asks what is needed first. Mail alerts and the
+            # unanswered-request sweep still escalate automatically.
             conversational = item["channel"] in ("teams", "whatsapp") and why in (
-                "direct message", "you were mentioned", "your instruction via WhatsApp")
-            _inject_buf.append((_summary_line(item, why), not conversational))
-            _inject_later()
+                "direct message", "you were mentioned", "your instruction via WhatsApp",
+                "reply in a thread you posted in", "follow-up to their tag of you")
+            if item["channel"] in ("teams", "whatsapp") and why != "your instruction via WhatsApp":
+                # Give the user a moment: if they read it themselves first, it is theirs.
+                threading.Thread(target=_queue_after_read_check, args=(item, why, not conversational), daemon=True).start()
+            else:
+                _inject_buf.append((_summary_line(item, why), not conversational))
+                _inject_later()
     render_today()
     log(f"{item['channel']}: {'IMPORTANT ' if important else ''}{item.get('from')} -> {item.get('text','')[:80]!r} [{why}]")
 
@@ -1008,8 +1491,6 @@ class H(BaseHTTPRequestHandler):
             return
         try:
             item = normalise_whatsapp(evt)
-            if item.get("from_me"):
-                return
             record(item)
         except Exception as e:
             _state["errors"] += 1
@@ -1017,6 +1498,7 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
+    _seed_own_posts()
     if "--login" in sys.argv:
         tok = token(interactive=True)
         print("signed in" if tok else "sign-in failed"); return 0 if tok else 1
@@ -1033,6 +1515,7 @@ def main():
     except Exception as e:
         log(f"token check: {e}")
     threading.Thread(target=renewal_loop, daemon=True).start()
+    threading.Thread(target=_presence_watch, daemon=True).start()
     render_today()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
