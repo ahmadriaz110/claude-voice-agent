@@ -18,6 +18,19 @@
 # The bridge answers {"ok":true,...,"media":"audio","voiceNote":true}.
 payload="$1"
 WA_URL="${WA_DAEMON_URL:-http://127.0.0.1:47823}"
+# Guard: a throwaway "TEST" line once went to a client from a compound command.
+# Test-looking messages go only to your own second number (INBOX_ESCALATE_TO);
+# to anyone else they are refused here.
+if printf '%s' "$payload" | python3 -c 'import sys, json, os
+try:
+    j = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+m = (j.get("message") or "").strip(); ph = (j.get("phone") or "").replace(" ", "").lstrip("+")
+own = os.environ.get("INBOX_ESCALATE_TO", "").replace(" ", "").lstrip("+")
+sys.exit(1 if (m.upper().startswith("TEST") and (not own or ph != own)) else 0)'; then :; else
+  echo '{"ok": false, "error": "refused: test-looking message to a number that is not your own"}'; exit 1
+fi
 resp=$(curl -s -X POST "$WA_URL/send" -H 'Content-Type: application/json' -d "$payload")
 echo "$resp"
 python3 - "$payload" "$resp" <<'PY'
@@ -33,5 +46,6 @@ p = pathlib.Path.home()/".voicemode"/"agent_sent_ids.jsonl"
 with open(p, "a") as f:
     f.write(json.dumps({"id": resp.get("id"), "chat": resp.get("to",""),
                         "text": text[:400],
+                        "media": bool(sent.get("document") or sent.get("audio") or sent.get("image")),
                         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()})+"\n")
 PY

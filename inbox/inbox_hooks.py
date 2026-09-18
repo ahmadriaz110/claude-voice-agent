@@ -158,7 +158,16 @@ OWN_DOMAIN = os.environ.get("INBOX_OWN_DOMAIN", ME_EMAIL.split("@")[-1])
 CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 TENANT = os.environ.get("INBOX_TENANT", "common")
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT}"
-SCOPES = ["Mail.Read", "Chat.Read", "ChatMessage.Read", "User.Read"]
+# Mail.Read.Shared and the calendar scopes let the receiver read a shared
+# mailbox (a projects@ style inbox) and the calendar; Mail.Send.Shared sends
+# from that shared mailbox; ChatMessage.Send lets the agent post Teams messages
+# with real @mentions through Graph (the desktop app cannot); the channel
+# scopes cover Teams channels. Adding a scope means a new device-code sign-in.
+SCOPES = ["Mail.Read", "Mail.Read.Shared", "Mail.Send.Shared",
+          "Calendars.Read", "Calendars.Read.Shared",
+          "Chat.Read", "ChatMessage.Read", "ChatMessage.Send",
+          "ChannelMessage.Read.All", "Team.ReadBasic.All", "Channel.ReadBasic.All",
+          "User.Read"]
 GRAPH = "https://graph.microsoft.com/v1.0/"
 MAIL_SUB_MIN = 4200          # Graph max for mail is 4230 minutes
 CHAT_SUB_MIN = 55            # Graph max for chat messages is 60 minutes
@@ -602,6 +611,12 @@ def _is_request(m, folder):
         return False
     blob = ((m.get("subject") or "") + " " + (m.get("bodyPreview") or "")).lower()
     if "automatic reply" in blob or "out of office" in blob:
+        return False
+    # Meeting responses and cancellations are calendar traffic, not requests
+    # (a "Canceled: weekly connect" once sat in the sweep as unanswered for 3 h).
+    subj = (m.get("subject") or "").strip().lower()
+    if subj.startswith(("canceled:", "cancelled:", "accepted:", "declined:", "tentative:",
+                        "updated invitation", "invitation:")):
         return False
     # Portal notices addressed to a client's own approver (pre-billing uploads,
     # referrals) are system mail, not a request to us: INBOX_SYSTEM_PHRASES.

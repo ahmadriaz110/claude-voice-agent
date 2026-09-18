@@ -39,7 +39,9 @@ WHAT IT DOES
   4. Transcribes afterwards: each chunk -> ffmpeg -ar 16000 -ac 1 -> POST to the
      whisper server (CALLWATCH_WHISPER_URL, OpenAI shape, verbose_json, language
      auto; re-run as Urdu when it says hi/pa, like inbox_hooks._whisper), quiet
-     chunks get a fixed gain first, silent ones are skipped. transcript.txt has one
+     chunks get a fixed gain first, silent ones are skipped, pieces with under
+     CALLWATCH_MIN_SPEECH_S seconds of speech are not uploaded, and repeated
+     segments (whisper looping on silence) are dropped. transcript.txt has one
      line per segment, sorted by time, tagged MIC / REMOTE. The agent summarises it;
      this script never does.
   5. Runs as ~/Library/LaunchAgents/com.voicemode.callwatch.plist (KeepAlive,
@@ -141,6 +143,11 @@ REQUIRE_OUTPUT = os.environ.get("CALLWATCH_REQUIRE_OUTPUT", "1") != "0"
 # Substring of the input device name to record from (your headset); empty
 # means the system default input.
 MIC_DEVICE = os.environ.get("CALLWATCH_MIC", "")
+# Minimum seconds of detected speech for a piece to be worth uploading. Whisper
+# hallucinates on pieces where the speaker only listens (a 21-minute call once
+# came back as one sentence repeated 280 times on the mic side), so pieces with
+# almost no speech are not uploaded at all.
+MIN_SPEECH_S = float(os.environ.get("CALLWATCH_MIN_SPEECH_S", "6"))
 APPS = ("Teams", "WhatsApp")
 # launchd agents get a bare PATH; homebrew ffmpeg lives outside it.
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
@@ -450,6 +457,44 @@ def _fmt_t(sec):
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
 
 
+def _speech_seconds(path, thresh_db=-38.0, min_sil=0.5):
+    """Seconds of non-silence in a WAV per ffmpeg silencedetect, None if unknown."""
+    try:
+        r = subprocess.run([FFMPEG, "-hide_banner", "-i", str(path), "-af",
+                            f"silencedetect=noise={thresh_db}dB:d={min_sil}", "-f", "null", "-"],
+                           capture_output=True, text=True)
+    except Exception:
+        return None
+    dur = 0.0
+    m = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", r.stderr)
+    if m:
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    silent = sum(float(x) for x in re.findall(r"silence_duration:\s*([\d.]+)", r.stderr))
+    return max(0.0, dur - silent) if dur else None
+
+
+def _norm_txt(t):
+    return re.sub(r"[\s\W_]+", " ", t.lower()).strip()
+
+
+def _drop_loops(segs):
+    """Remove whisper's repetition hallucinations: a segment that repeats one of the
+    previous three on the same side, and any run where one phrase dominates."""
+    out, recent = [], []
+    for s0, s1, t in segs:
+        n = _norm_txt(t)
+        if not n or n in recent:
+            continue
+        out.append((s0, s1, t))
+        recent = (recent + [n])[-3:]
+    if len(out) >= 6:
+        from collections import Counter
+        top = Counter(_norm_txt(t) for _, _, t in out).most_common(1)[0]
+        if top[1] >= max(4, len(out) // 2):
+            out = [x for x in out if _norm_txt(x[2]) != top[0]][:1] + [x for x in out if _norm_txt(x[2]) == top[0]][:1]
+    return out
+
+
 def transcribe_dir(call_dir):
     """Build <dir>/transcript.txt from mic-NNN.wav / remote-NNN.wav. Returns (path, words)."""
     call_dir = Path(call_dir)
@@ -486,6 +531,14 @@ def transcribe_dir(call_dir):
             for pi, piece in enumerate(pieces):
                 poff = offset + pi * PIECE_S
                 text = ""
+                spoken = _speech_seconds(piece)
+                if spoken is not None and spoken < MIN_SPEECH_S:
+                    log(f"transcribe: {f.name}[{pi + 1}/{len(pieces)}] only {spoken:.0f}s of speech, skipped")
+                    try:
+                        piece.unlink()
+                    except OSError:
+                        pass
+                    continue
                 for attempt in (1, 2, 3):
                     try:
                         t0 = time.time()
@@ -505,7 +558,10 @@ def transcribe_dir(call_dir):
                     continue
                 got_any = True
                 if segs:
-                    for s0, s1, t in segs:
+                    kept = _drop_loops(segs)
+                    if len(kept) < len(segs):
+                        log(f"transcribe: {f.name}[{pi + 1}/{len(pieces)}] dropped {len(segs) - len(kept)} repeated segment(s)")
+                    for s0, s1, t in kept:
                         entries.append((poff + s0, side, t))
                 else:
                     entries.append((poff, side, text))

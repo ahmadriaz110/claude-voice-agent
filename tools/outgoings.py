@@ -62,11 +62,21 @@ try:
     d = "/tmp/outgoings_wa"; os.makedirs(d, exist_ok=True)
     for ext in ("", "-wal", "-shm"):
         if os.path.exists(src + ext): shutil.copy(src + ext, d + "/ChatStorage.sqlite" + ext)
-    agent = set()
+    agent = set(); agent_media_ts = []
     try:
         for line in open(os.path.expanduser("~/.voicemode/agent_sent_ids.jsonl")):
-            try: agent.add(json.loads(line).get("text", "")[:80])
-            except Exception: pass
+            try:
+                j = json.loads(line); tx = (j.get("text") or "")[:80]
+                # Agent audio/document sends log an empty (or caption-only) text,
+                # and WhatsApp stores a media send with an empty ZTEXT, so text
+                # sends are matched by text and media sends by timestamp. An empty
+                # string in the set once hid EVERY voice note the user sent.
+                if tx:
+                    agent.add(tx)
+                if j.get("ts"):
+                    agent_media_ts.append(datetime.datetime.fromisoformat(j["ts"]).timestamp())
+            except Exception:
+                pass
     except FileNotFoundError:
         pass
     c = sqlite3.connect(d + "/ChatStorage.sqlite")
@@ -75,8 +85,10 @@ try:
            JOIN ZWACHATSESSION s ON s.Z_PK=m.ZCHATSESSION WHERE m.ZISFROMME=1 AND m.ZMESSAGEDATE > strftime('%s','now')-978307200-? ORDER BY m.ZMESSAGEDATE"""
     for ts, who, jid, typ, txt in c.execute(q, (since_s,)):
         txt = txt or ""
-        if txt[:80] in agent or txt.startswith(AGENT_PREFIXES):
+        if txt and (txt[:80] in agent or txt.startswith(AGENT_PREFIXES)):
             continue
+        if not txt and any(abs((ts + 978307200) - a) < 90 for a in agent_media_ts):
+            continue  # agent-sent media (voice note / document), matched by time
         t = datetime.datetime.fromtimestamp(ts + 978307200, datetime.timezone.utc)
         kind = {3: "voice note", 1: "image", 59: "call", 14: "deleted", 15: "reaction"}.get(typ, "")
         # never echo credentials: a short message with a password-looking token
